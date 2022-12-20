@@ -1288,10 +1288,21 @@ class StructureBoard {
             );
         }
 
-        var headDiff = dd.diff(document.head, newDoc.head);
+        //var headDiff = dd.diff(document.head, newDoc.head);
 
         StructureBoard._replaceBodyWithHTML(newDoc.body.innerHTML);
-        dd.apply(document.head, headDiff);
+        //dd.apply(document.head, headDiff);
+        $(document).find('head > style').detach(); // remove existing styles
+        // any nested style would be inside <noscript> and we do not need to worry about that during CMS previews        
+        $(newDoc)
+            .find('head > style')
+            .each(function (index, el) {
+                var el = $(this);
+                //console.log(el);
+                $(document).find('head').append(el.clone());
+            });
+        //
+
         toolbar.prependTo(document.body);
         CMS.API.Toolbar._refreshMarkup(newToolbar);
 
