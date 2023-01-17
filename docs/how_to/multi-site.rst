@@ -20,7 +20,7 @@ ALLOWED_HOSTS etc., which may be site-specific or not.
     settings that should be different on the sites. This way all the items from the imported base
     settings can be overridden by later definitions:
 
-    ``settings.second_site.py``:
+    ``settings_second_site.py``:
 
     ::
 
