@@ -1,3 +1,221 @@
+5.0.13 (2026-09-24)
+===================
+
+Bug Fixes:
+----------
+* Validate path of overwrite url (#8888) (#8892) (#8895) (36882321a) -- Fabian Braun
+
+Statistics:
+-----------
+
+This release includes 1 changelog entry, created with the help of the following contributors
+(in alphabetical order):
+
+* Fabian Braun (1 changelog entry)
+
+With the review help of the following contributors:
+
+* Claude Opus 5.5 (1M context)
+
+Thanks to all contributors for their efforts!
+
+5.0.12 (2026-09-18)
+===================
+
+Bug Fixes:
+----------
+* Restricted placeholders hid explicitly declared child plugins (regression from #8215) (#8432) -- Fabian Braun
+* AddPageForm did not check all required CMS permissions (#8822) (#8834) (1f219540e) -- Fabian Braun
+* Check page source when adding a apage (#8858) (#8869) (31f227e78) -- Fabian Braun
+* GrouperAdmin wrote to the wrong content object when one was selected by pk (#8826) (#8836) (0c4afbd58) -- Fabian Braun
+* Harden CMS permissions (#8874) (#8878) (560c2dac6) -- Fabian Braun
+* Preserve best-effort CMS mail delivery (#8842) (#8850) (a90dd95e5) -- Fabian Braun
+* Slug uniqueness ignored site (#8831) (#8838) (f18a849c0) -- Fabian Braun
+* Some inline editing modals did not contain _popup=1 query param for Django (#8816) (#8820) (c49972a8c) -- Fabian Braun
+* Wizard now rejects pages for other sites (#8848) (#8852) (db8718a87) -- Fabian Braun
+* appresolver get_app_patterns (#8887) (#8890) -- Venelin Stoykov
+* cross-placeholder parent authorization in paste-a-copy (#8849) (#8880) (aae42ed6a) -- Fabian Braun
+* page-tree copy can disclose view-restrictions (#8840) (#8854) (#8856) (ebfa15e14) -- Fabian Braun
+
+Documentation:
+--------------
+* Provide redirect for help menu (#8862) (#8865) (3692e22f2) -- Fabian Braun
+
+Statistics:
+-----------
+
+This release includes 12 changelog entries, created with the help of the following contributors
+(in alphabetical order):
+
+* Fabian Braun (11 changelog entries)
+* Venelin Stoykov (1 changelog entry)
+
+With the review help of the following contributors:
+
+* Github Release Action
+* Vinit Kumar
+* sourcery-ai[bot]
+
+Thanks to all contributors for their efforts!
+
+5.0.11 (2026-08-27)
+===================
+
+Bug Fixes:
+----------
+* Edit and view endpoints did not check placeholder permissions (#8794) (#8809) (040a7b1ba) -- Fabian Braun
+* Grouper admin ignored read-only context for content objects without language field (#8799) (#8808) (c39fbe3e0) -- Fabian Braun
+* Manual page slug was overwritten when changing page title (#8796) (#8807) (95164e017) -- Fabian Braun
+* Copy page missed login required property (#8785) (#8806) (54f505c3c) -- Fabian Braun
+* Language column in page tree ignored multi-hyphen language codes like de-x-l (#8781) (#8805) (c104ee335) -- Fabian Braun
+* Page tree had a n+1 regression fetching urls (#8716) (#8804) (62be07364) -- Fabian Braun
+* check and delete-orphaned-plugins had an n+1 issue (#8701) (#8803) (691ca5496) -- Fabian Braun
+* GrouperAdmin only showed current content versions (#8700) (#8802) (6747be6d1) -- Fabian Braun
+
+Statistics:
+-----------
+
+This release includes 8 changelog entries, created with the help of the following contributors
+(in alphabetical order):
+
+* Fabian Braun (8 changelog entries)
+
+With the review help of the following contributors:
+
+* Fabian Braun
+* Vinit Kumar
+
+Thanks to all contributors for their efforts!
+
+5.0.10 (2026-08-06)
+===================
+
+Features:
+---------
+* Offer replacement for djangotree-beard dependency (#8744) (#8755) (e358d7eab) -- Fabian Braun
+
+Bug Fixes:
+----------
+* EmptyToolbar missed clipboard and toolbar_language properties (#8745) (#8756) (8594f7c84) -- Fabian Braun
+* Paste-a-copy IDOR discloses unauthorized plugin content (#8746) (#8757) (551302612) -- Fabian Braun
+* Upon edit localized text within plugins were rendered in the wrong language (#8740) (2eaa0e573) -- Fabian Braun
+
+Statistics:
+-----------
+
+This release includes 9 pull requests, and was created with the help of the following contributors (in alphabetical order):
+
+* Fabian Braun (6 pull requests)
+
+With the review help of the following contributors:
+
+
+Thanks to all contributors for their efforts!
+
+5.0.9 (2026-07-10)
+==================
+
+Features:
+---------
+* Accessibility update for wizards (#8674) (#8679) (c91db51ce) -- Fabian Braun
+* Support django 6.1+ breadcrumb styles (#8689) (#8714) (ffd05c4f8) -- Fabian Braun
+
+Bug Fixes:
+----------
+* Corrupted plugin positions are now automatically healed (#8667) (#8670) (5a71802c9) -- Fabian Braun
+* Harden page duplication, group permissions and URL validator (#8704) (#8713) (3e1ccf757) -- Fabian Braun
+* Language selector triggered wrong toolbar (#8687) (#8693) (2b5de9f19) -- Fabian Braun
+* Missing authorization in `render_object_structure` disclosed non-PageContent placeholder structure (#8692) (#8703) (9c82abfeb) -- Fabian Braun
+* Page title leaked unescaped into rendering error message, clipboard could be cleared by get request (#8699) (#8711) (b56a56884) -- Fabian Braun
+* Replace left-over inline JS/CSS that might be blocked by CSP (#8690) (#8715) (3edf89a0a) -- Fabian Braun
+* Subpage wizard failed (#8698) (#8710) (27b1f6313) -- Fabian Braun
+* get_child_classes was always cached (#8677) (#8680) (330d4a36d) -- Fabian Braun
+
+Statistics:
+-----------
+
+This release includes 14 pull requests, and was created with the help of the following contributors (in alphabetical order):
+
+* Fabian Braun (10 pull requests)
+
+With the review help of the following contributors:
+
+* Github Release Action
+* Vinit Kumar
+* sourcery-ai[bot]
+
+Thanks to all contributors for their efforts!
+
+5.0.8 (2026-06-09)
+==================
+
+Bug Fixes:
+----------
+* Enforce authorization on structure, move and clipboard endpoints (#8644) (#8645) (7642a98ab) -- Fabian Braun
+* GrouperModelAdmin shadowed prepopulated_fields class attribute (#8636) (#8639) (1b164a488) -- Fabian Braun
+* Honour plugin-declared Vary headers in the page cache key (#8646) (#8647) (d5dc1efa1) -- Fabian Braun
+* Missing redirect_url in CMSNavigationNode.attr (#8625) (f975cace5) -- Venelin Stoykov
+* Release script dropped changes (#8655) (23df299bd) -- Fabian Braun
+* Slugs of published pages could be changed (#8640) (#8654) (9fed876a0) -- Fabian Braun
+* Transifex upload script failed (#8656) (936a620ef) -- Fabian Braun
+* template-specific CMS_PLACEHOLDER_CONF keys ignored when rendering page placeholders (#8652) (c7424f7f2) -- Ralph
+* Correct lookup prefix and register length lookup in PermissionTuple.allow_list()
+* Use loop variable instead of queryset in user_can_delete_page placeholder check
+* Return 404 instead of 500 for missing objects in delete_view and edit_title_fields
+* Use target language for position shift and cache clearing in _paste_placeholder
+
+Statistics:
+-----------
+
+This release includes 14 pull requests, and was created with the help of the following contributors (in alphabetical order):
+
+* Fabian Braun (8 pull requests)
+* Ralph (1 pull request)
+* Venelin Stoykov (1 pull request)
+
+With the review help of the following contributors:
+
+* Fabian Braun
+* Vinit Kumar
+
+Thanks to all contributors for their efforts!
+
+5.0.7 (2026-05-05)
+==================
+
+Bug Fixes:
+----------
+
+* Keep GET params when toggling structure mode by @petrklus in https://github.com/django-cms/django-cms/pull/8497
+* slug and overwrite_url caching failed in read-only change_views (#8507) by @fsbraun in https://github.com/django-cms/django-cms/pull/8509
+* Add missing pin icon for external placeholders by @fsbraun in https://github.com/django-cms/django-cms/pull/8520
+* Chunk size was missing for plugin queryset.iterator() (#8532) by @fsbraun in https://github.com/django-cms/django-cms/pull/8533
+* Proxy models of `CMSPlugin` were not downcasted correctly (#8539) by @fsbraun in https://github.com/django-cms/django-cms/pull/8541
+* Inline editing could circumvent permissions (#8542) by @fsbraun in https://github.com/django-cms/django-cms/pull/8553
+* Fallback languages rendered empty (when not redirecting) by @fsbraun in https://github.com/django-cms/django-cms/pull/8558
+* DiffDOM sometimes left garbled head section by @fsbraun in https://github.com/django-cms/django-cms/pull/8562
+* Add `page_title` parameter to `cms.api.create_page` function (#8567) by @fsbraun in https://github.com/django-cms/django-cms/pull/8572
+* XSS vulnerability in validator error message (#8576) by @fsbraun in https://github.com/django-cms/django-cms/pull/8580
+* Deleting a non-local plugin did not refresh the screen (#8582) by @fsbraun in https://github.com/django-cms/django-cms/pull/8586
+* Compatibility shim for Page.objects.order_by used non-existing fields by @fsbraun in https://github.com/django-cms/django-cms/pull/8598
+* Convert value to string in ApplicationConfigSelect. (#8594) by @fsbraun in https://github.com/django-cms/django-cms/pull/8601
+* Migrations with a custom user model caused a Programming error (#8606) by @fsbraun in https://github.com/django-cms/django-cms/pull/8608
+* deadlock could happen on moving large pagesubtrees (#8529) by @fsbraun in https://github.com/django-cms/django-cms/pull/8610
+* resolve empty page_title in frontend edit mode for apphooks (#8449) by @fsbraun in https://github.com/django-cms/django-cms/pull/8617
+
+Statistics:
+-----------
+
+This release includes 15 pull requests, and was created with the help of the following contributors (in alphabetical order):
+
+* Fabian Braun (15 pull request)
+
+With the review help of the following contributors:
+
+* Vinit Kumar
+
+Thanks to all contributors for their efforts!
+
 5.0.6 (2026-02-22)
 ==================
 

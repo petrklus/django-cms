@@ -4,8 +4,8 @@ from os.path import join
 
 from django.contrib.auth import get_user_model
 from django.contrib.sites.models import Site
-from django.db import IntegrityError, models
-from django.db.models import F, Prefetch, Q
+from django.db import IntegrityError, connection, models, router
+from django.db.models import Prefetch
 from django.db.models.base import ModelState
 from django.db.models.constraints import UniqueConstraint
 from django.db.models.functions import Concat
@@ -14,7 +14,6 @@ from django.urls import NoReverseMatch, reverse
 from django.utils.encoding import force_str
 from django.utils.timezone import now
 from django.utils.translation import get_language, gettext_lazy as _, override as force_language
-from treebeard.mp_tree import MP_Node
 
 from cms import constants
 from cms.models.managers import PageManager, PageUrlManager
@@ -22,10 +21,21 @@ from cms.utils import i18n
 from cms.utils.compat.warnings import RemovedInDjangoCMS60Warning
 from cms.utils.conf import get_cms_setting
 from cms.utils.i18n import get_current_language
+from cms.utils.mptree import get_tree_base
 from cms.utils.page import get_clean_username
 from menus.menu_pool import menu_pool
 
 logger = getLogger(__name__)
+
+
+def _lock_tree_roots(*pages):
+    # Serializes concurrent URL path updates by taking a row-level lock on the
+    # tree root(s) of the given pages, which prevents deadlocks on cms_pageurl.
+    # Locks are acquired in pk order to avoid deadlocks between the locks
+    # themselves when two roots are involved.
+    assert connection.in_atomic_block, "_lock_tree_roots requires an active transaction"
+    pks = sorted({page.get_root().pk for page in pages})
+    list(Page.objects.filter(pk__in=pks).order_by("pk").select_for_update())
 
 
 class AdminCacheDict(dict):
@@ -34,6 +44,8 @@ class AdminCacheDict(dict):
     def __setitem__(self, key, value):
         raise ValueError("Do not set individual items in the admin cache dict. Use the clear_cache method instead.")
 
+
+MP_Node = get_tree_base()
 
 class Page(MP_Node):
     """
@@ -141,7 +153,7 @@ class Page(MP_Node):
         #: Internal cache for page urls
         self.page_content_cache = {}
         #: Internal cache for page content objects visible publicly
-        self.admin_content_cache = AdminCacheDict()
+        self.admin_content_cache = None
         #: Internal cache for page content objects visible in the admin (i.e. to staff users.)
         #: Might be larger than the page_content_cache
 
@@ -202,7 +214,7 @@ class Page(MP_Node):
     def _clear_internal_cache(self):
         self.urls_cache = {}
         self.page_content_cache = {}
-        self.admin_content_cache = AdminCacheDict()
+        self.admin_content_cache = None
 
         if hasattr(self, "_prefetched_objects_cache"):
             del self._prefetched_objects_cache
@@ -238,8 +250,11 @@ class Page(MP_Node):
                 site=self.site_id,
             )
         except self.__class__.DoesNotExist:
+            _lock_tree_roots(self)
             old_home_tree = []
         else:
+            _lock_tree_roots(self, old_home)
+
             old_home.update(
                 is_home=False,
                 changed_by=changed_by,
@@ -385,7 +400,7 @@ class Page(MP_Node):
         else:
             self.parent.add_sibling(pos=position, instance=self)
 
-    def move_page(self, target_page, position="first-child"):
+    def move_page(self, target_page, position="first-child", user=None):
         """
         Called from admin interface when page is moved. Should be used on
         all the places which are changing page position. Used like an interface
@@ -393,6 +408,10 @@ class Page(MP_Node):
         """
         assert isinstance(target_page, Page), f"{target_page} is not an instance of Page."
         inherited_template = self.template == constants.TEMPLATE_INHERITANCE_MAGIC
+
+        # Snapshot before the move: the ancestors protecting this subtree stop
+        # doing so as soon as its path changes.
+        inherited_restrictions = self.get_view_restrictions(inherited_only=True)
 
         if inherited_template and target_page.is_root() and position in ("left", "right"):
             # The page is being moved to a root position.
@@ -417,8 +436,13 @@ class Page(MP_Node):
         self.update(parent=self.parent)
         self.refresh_from_db(fields=("path", "depth"))
 
-        # Update the urls for the page being moved
-        # and is descendants.
+        # The subtree left the ancestors it inherited its view restrictions
+        # from, so they have to be materialized on its new root.
+        self.apply_view_restrictions(inherited_restrictions, user=user)
+
+        # Update the urls for the page being moved and its descendants.
+        _lock_tree_roots(self)
+
         languages = self.urls.values_list("language", flat=True)
 
         for language in languages:
@@ -436,6 +460,85 @@ class Page(MP_Node):
         plugins = CMSPlugin.objects.filter(placeholder__in=placeholder_ids, language=language)
         models.query.QuerySet.delete(plugins)
         return placeholders
+
+    def get_view_restrictions(self, inherited_only=False):
+        """Snapshot the ``can_view`` grants that currently protect this page.
+
+        Each entry is a ``(user_id, group_id, grant_on)`` tuple whose scope is
+        expressed relative to *this* page: a grant inherited from an ancestor
+        becomes ``ACCESS_PAGE_AND_DESCENDANTS`` when it also covers what is
+        below this page, and ``ACCESS_PAGE`` when it stops here. The page's own
+        rows keep their own scope.
+        """
+        from cms.models import ACCESS_PAGE, ACCESS_PAGE_AND_DESCENDANTS, PagePermission
+        from cms.models.permissionmodels import MASK_DESCENDANTS
+
+        if not get_cms_setting("PERMISSION"):
+            return []
+
+        restrictions = [
+            (
+                permission.user_id,
+                permission.group_id,
+                ACCESS_PAGE_AND_DESCENDANTS if permission.grant_on & MASK_DESCENDANTS else ACCESS_PAGE,
+            )
+            for permission in PagePermission.objects.for_page(self).filter(can_view=True)
+            if permission.page_id != self.pk
+        ]
+
+        if not inherited_only:
+            restrictions += [
+                (permission.user_id, permission.group_id, permission.grant_on)
+                for permission in self.pagepermission_set.filter(can_view=True)
+            ]
+        return restrictions
+
+    def apply_view_restrictions(self, restrictions, user=None):
+        """Recreate ``restrictions`` (from ``get_view_restrictions``) on this page.
+
+        Used when a page leaves the subtree its view restrictions came from: the
+        ancestors that protected it no longer do, so their grants have to be
+        materialized here. Only ``can_view`` is carried over -- the editing
+        privileges attached to the original rows are not privileges of the new
+        location. Grants the page already inherits at its new position with at
+        least the same scope are skipped, so repeated moves do not pile up
+        redundant rows.
+        """
+        from cms.cache.permissions import clear_permission_cache
+        from cms.models import PagePermission
+        from cms.models.permissionmodels import MASK_DESCENDANTS
+        from cms.utils.permissions import clear_permission_lru_caches
+
+        if not restrictions or not get_cms_setting("PERMISSION"):
+            return []
+
+        def scope(grant_on):
+            return 2 if grant_on & MASK_DESCENDANTS else 1
+
+        covered = {}
+        for permission in PagePermission.objects.for_page(self).filter(can_view=True):
+            audience = (permission.user_id, permission.group_id)
+            covered[audience] = max(covered.get(audience, 0), scope(permission.grant_on))
+
+        new_permissions = [
+            PagePermission(
+                page=self,
+                user_id=user_id,
+                group_id=group_id,
+                grant_on=grant_on,
+                **{flag: flag == "can_view" for flag in PagePermission.get_all_permissions()},
+            )
+            for user_id, group_id, grant_on in restrictions
+            if scope(grant_on) > covered.get((user_id, group_id), 0)
+        ]
+
+        if new_permissions:
+            PagePermission.objects.bulk_create(new_permissions)
+            # bulk_create does not emit the permission signals.
+            clear_permission_cache()
+            if user is not None:
+                clear_permission_lru_caches(user)
+        return new_permissions
 
     def copy(
         self,
@@ -463,9 +566,9 @@ class Page(MP_Node):
             parent_page = parent_page or parent_node
 
         if parent_page:
-            new_page = parent_page.add_child(site=site)
+            new_page = parent_page.add_child(site=site, login_required=self.login_required)
         else:
-            new_page = Page.add_root(site=site)
+            new_page = Page.add_root(site=site, login_required=self.login_required)
 
         new_page._state = ModelState()
         new_page._clear_internal_cache()
@@ -530,7 +633,13 @@ class Page(MP_Node):
                 permissions_new.append(permission)
 
             if permissions_new:
+                from cms.cache.permissions import clear_permission_cache
+                from cms.utils.permissions import clear_permission_lru_caches
+
                 new_page.pagepermission_set.bulk_create(permissions_new)
+                # bulk_create does not emit the permission signals.
+                clear_permission_cache()
+                clear_permission_lru_caches(user)
         return new_page
 
     def copy_with_descendants(
@@ -567,7 +676,10 @@ class Page(MP_Node):
                 Prefetch("pagecontent_set", queryset=PageContent.admin_manager.all()),
             )
         )
-        new_root_page = self.copy(target_site, parent_page=parent_page, user=user)
+        if copy_permissions:
+            # Snapshot paths before inserting the copy can move source nodes.
+            inherited_restrictions = self.get_view_restrictions(inherited_only=True)
+        new_root_page = self.copy(target_site, parent_page=parent_page, permissions=copy_permissions, user=user)
 
         if target_page and position in ("first-child"):
             # target page is a parent and user has requested to
@@ -586,13 +698,20 @@ class Page(MP_Node):
             pages_by_id[page.id] = page.copy(
                 target_site, parent_page=parent, translations=True, permissions=copy_permissions, user=user
             )
+
+        if copy_permissions:
+            # Ancestors outside the copied subtree will no longer protect it.
+            new_root_page.apply_view_restrictions(inherited_restrictions, user=user)
         return new_root_page
 
     def delete(self, *args, **kwargs):
-        Page.get_tree(self).delete_fast()
+        using = self._state.db or router.db_for_write(Page, instance=self)
+        Page.get_tree(self).using(using).delete_fast()
 
-        if self.parent:
-            Page.objects.filter(id=self.parent_id).update(numchild=models.F("numchild") - 1)
+        if self.parent_id:
+            Page.objects.using(using).filter(id=self.parent_id).update(
+                numchild=models.F("numchild") - 1
+            )
         self.clear_cache(menu=True)
 
     def delete_translations(self, language=None):
@@ -668,7 +787,9 @@ class Page(MP_Node):
         return self.get_descendants().order_by("path")
 
     def get_root(self):
-        return self.__class__.objects.get(path=self.path[0 : self.steplen])
+        return self.__class__.objects.using(self._state.db).get(
+            path=self.path[0 : self.steplen]
+        )
 
     def get_parent_page(self):
         warnings.warn(
@@ -690,7 +811,7 @@ class Page(MP_Node):
     def get_languages(self, admin_manager=True):
         """Returns available languages for the page. This is potentially costly."""
         if admin_manager:
-            if not self.admin_content_cache:
+            if self.admin_content_cache is None:
                 self.set_admin_content_cache()
             return list(self.admin_content_cache.keys())
         if not self.page_content_cache:
@@ -737,7 +858,7 @@ class Page(MP_Node):
     def get_admin_content(self, language, fallback=False):
         from cms.models.contentmodels import EmptyPageContent
 
-        if not self.admin_content_cache:
+        if self.admin_content_cache is None:
             self.set_admin_content_cache()
         page_content = self.admin_content_cache.get(language, EmptyPageContent(language=language, page=self))
         if not page_content and fallback:

@@ -14,9 +14,10 @@ from django.contrib.sites.models import Site
 from django.http import HttpRequest
 from django.template import Context
 from django.utils.functional import cached_property
+from django.utils.html import format_html
 from django.utils.module_loading import import_string
 from django.utils.safestring import SafeText, mark_safe
-from django.utils.translation import override
+from django.utils.translation import get_language, override
 from django.views.debug import ExceptionReporter
 
 from cms.cache.placeholder import get_placeholder_cache, set_placeholder_cache
@@ -41,7 +42,7 @@ from cms.utils.plugins import get_plugin_restrictions
 logger = logging.getLogger(__name__)
 
 
-def _unpack_plugins(parent_plugin: CMSPlugin) -> Generator[CMSPlugin, None, None]:
+def _unpack_plugins(parent_plugin: CMSPlugin) -> Generator[CMSPlugin]:
     yield parent_plugin
     for plugin in parent_plugin.child_plugin_instances or []:
         yield from _unpack_plugins(plugin)
@@ -429,12 +430,13 @@ class ContentRenderer(BaseRenderer):
             return ""
 
         current_page = page or self.current_page
+        language = get_language()
         placeholder_cache = self._placeholders_by_page_cache
 
         if current_page.pk not in placeholder_cache:
             # Instead of loading plugins for this one placeholder
             # try and load them for all placeholders on the page.
-            self._preload_placeholders_for_page(current_page)
+            self._preload_placeholders_for_page(current_page, language=language)
 
         try:
             placeholder = placeholder_cache[current_page.pk][slot]
@@ -445,6 +447,7 @@ class ContentRenderer(BaseRenderer):
             content = self.render_placeholder(
                 placeholder,
                 context=context,
+                language=language,
                 page=current_page,
                 editable=editable,
                 use_cache=True,
@@ -596,7 +599,7 @@ class ContentRenderer(BaseRenderer):
                 html = reporter.get_traceback_html()
             else:
                 html = ""
-            heading = f'<h2 class="cms-rendering-exception-title">{message}</h2>'
+            heading = format_html('<h2 class="cms-rendering-exception-title">{}</h2>', message)
             if "_last_plugin" in context:
                 # Make error message editable by double-click to open the editor for the plugin causing the exception
                 instance = context["_last_plugin"]
@@ -621,7 +624,7 @@ class ContentRenderer(BaseRenderer):
         context,
         editable: bool = False,
         template: str | None = None,
-    ) -> Generator[SafeText | str, None, None]:
+    ) -> Generator[SafeText | str]:
         plugins = self.get_plugins_to_render(
             placeholder=placeholder,
             template=template,
@@ -690,7 +693,7 @@ class ContentRenderer(BaseRenderer):
         else:
             return Placeholder.objects.none()
 
-    def _preload_placeholders_for_page(self, page, slots=None, inherit=False):
+    def _preload_placeholders_for_page(self, page, language=None, slots=None, inherit=False):
         """
         Populates the internal plugin cache of each placeholder
         in the given page if the placeholder has not been
@@ -699,6 +702,7 @@ class ContentRenderer(BaseRenderer):
         from cms.utils.plugins import assign_plugins
 
         placeholders = self._get_content_object(page, slots=slots)
+        language = language or self.request_language
 
         if inherit:
             # When the inherit flag is True,
@@ -721,7 +725,7 @@ class ContentRenderer(BaseRenderer):
             placeholders_to_fetch = [
                 placeholder
                 for placeholder in placeholders
-                if _cached_content(placeholder, self.request_language) is None
+                if _cached_content(placeholder, language) is None
             ]
         else:
             # cache is disabled, prefetch plugins for all
@@ -733,7 +737,7 @@ class ContentRenderer(BaseRenderer):
                 request=self.request,
                 placeholders=placeholders_to_fetch,
                 template=page.get_template(),
-                lang=self.request_language,
+                lang=language,
             )
 
         # Inherit only placeholders that have no plugins
@@ -748,6 +752,7 @@ class ContentRenderer(BaseRenderer):
         if page.parent and placeholders_to_inherit:
             self._preload_placeholders_for_page(
                 page=page.parent,
+                language=language,
                 slots=placeholders_to_inherit,
                 inherit=True,
             )

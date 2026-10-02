@@ -6,6 +6,7 @@ from urllib.parse import parse_qsl, urlparse
 from django import forms
 from django.contrib import admin
 from django.contrib.admin.helpers import AdminForm
+from django.contrib.admin.options import IS_POPUP_VAR
 from django.contrib.admin.utils import flatten_fieldsets, get_deleted_objects
 from django.core.exceptions import PermissionDenied
 from django.db import models, transaction
@@ -13,6 +14,7 @@ from django.http import (
     HttpResponse,
     HttpResponseBadRequest,
     HttpResponseForbidden,
+    HttpResponseNotAllowed,
     HttpResponseNotFound,
 )
 from django.shortcuts import get_list_or_404, get_object_or_404
@@ -36,7 +38,12 @@ from cms.models.pluginmodel import CMSPlugin
 from cms.plugin_base import CMSPluginBase
 from cms.plugin_pool import plugin_pool
 from cms.signals import post_placeholder_operation, pre_placeholder_operation
-from cms.toolbar.utils import create_child_plugin_references, get_plugin_content, get_plugin_tree
+from cms.toolbar.utils import (
+    create_child_plugin_references,
+    get_plugin_content,
+    get_plugin_tree,
+    get_toolbar_from_request,
+)
 from cms.utils import get_current_site
 from cms.utils.compat.warnings import RemovedInDjangoCMS51Warning
 from cms.utils.conf import get_cms_setting
@@ -94,7 +101,7 @@ class BaseEditableAdminMixin:
         saved_successfully = False
         cancel_clicked = request.POST.get("_cancel", False)
         raw_fields = request.GET.get("edit_fields", "")
-        admin_obj = self._get_model_admin(obj)
+        admin_obj, change_permission = self._get_model_admin_and_permission(request, obj)
         allowed_fields = getattr(admin_obj, "frontend_editable_fields", [])
         fields = [field for field in raw_fields.split(",") if field in allowed_fields]
         if not fields:
@@ -103,13 +110,13 @@ class BaseEditableAdminMixin:
                 'message': _("Field %s not found") % raw_fields
             }
             return TemplateResponse(request, 'admin/cms/page/plugin/error_form.html', context)
-        if not request.user.has_perm(f"{admin_obj.model._meta.app_label}.change_{admin_obj.model._meta.model_name}"):
+        if not change_permission:
             context = {
                 'opts': opts,
                 'message': _("You do not have permission to edit this item")
             }
             return TemplateResponse(request, 'admin/cms/page/plugin/error_form.html', context)
-            # Dynamically creates the form class with only `field_name` field
+        # Dynamically creates the form class with only `field_name` field
         # enabled
         form_class = admin_obj.get_form(request, obj, fields=fields)
         if not cancel_clicked and request.method == 'POST':
@@ -167,10 +174,11 @@ class FrontendEditableAdminMixin(BaseEditableAdminMixin):
         ]
         return url_patterns + super().get_urls()
 
-    def _get_model_admin(self, obj: models.Model) -> admin.ModelAdmin:
+    def _get_model_admin_and_permission(self, request, obj: models.Model) -> tuple[admin.ModelAdmin, bool]:
         # FrontendEditableAdminMixin needs to be added to the model's model admin class.
         # Hence, the relevant admin is the model admin itself.
-        return self
+        change_permission =  request.user.has_perm(f"{obj._meta.app_label}.change_{obj._meta.model_name}")
+        return self, change_permission
 
     def _get_object_for_single_field(self, object_id: int, language: str) -> models.Model:
         # Quick and dirty way to retrieve objects for django-hvad
@@ -269,10 +277,15 @@ class PlaceholderAdmin(BaseEditableAdminMixin, admin.ModelAdmin):
         plugin = get_object_or_404(CMSPlugin, pk=object_id)  # Returns a CMSPlugin instance
         return plugin.get_bound_plugin()  # Returns the plugin model instance of the appropriate type
 
-    def _get_model_admin(self, obj: CMSPlugin) -> admin.ModelAdmin:
+    def _get_model_admin_and_permission(self, request, obj: CMSPlugin) -> tuple[admin.ModelAdmin, bool]:
         # For BaseEditableAdminMixin: This (private) method retrieves the model admin for the plugin model
-        # which is the plugin instance itself.
-        return obj.get_plugin_class_instance(admin=self.admin_site)
+        # which is the plugin instance itself, and checks change permissions including check_source
+        placeholder = obj.placeholder
+        has_permission = (
+            placeholder.has_change_plugin_permission(request.user, obj)
+            and placeholder.check_source(request.user)
+        )
+        return obj.get_plugin_class_instance(admin=self.admin_site), has_permission
 
     def _get_operation_language(self, request):
         # Unfortunately the ?language GET query
@@ -350,11 +363,29 @@ class PlaceholderAdmin(BaseEditableAdminMixin, admin.ModelAdmin):
 
     def has_copy_plugins_permission(self, request, plugins):
         # Plugins can only be copied to the clipboard
-        placeholder = request.toolbar.clipboard
+        placeholder = get_toolbar_from_request(request).clipboard
+        if placeholder is None:
+            # No toolbar, no clipboard to copy into.
+            return False
         return placeholder.has_add_plugins_permission(request.user, plugins)
 
     def has_copy_from_clipboard_permission(self, request, placeholder, plugins):
         return placeholder.has_add_plugins_permission(request.user, plugins)
+
+    def has_paste_from_source_permission(self, request, source_placeholder, plugins):
+        # Pasting reads the plugins from the placeholder they are pasted from,
+        # so a user without access to that placeholder must not be able to
+        # exfiltrate its content into a placeholder they do control.
+        clipboard = request.toolbar.clipboard
+
+        if clipboard and source_placeholder.pk == clipboard.pk:
+            # Pasting from the user's own clipboard, which is what this
+            # operation is for. A user may always read their own clipboard.
+            return True
+
+        if not source_placeholder.has_add_plugins_permission(request.user, plugins):
+            return False
+        return source_placeholder.check_source(request.user)
 
     def has_copy_from_placeholder_permission(self, request, source_placeholder, target_placeholder, plugins):
         if not source_placeholder.has_add_plugins_permission(request.user, plugins):
@@ -384,6 +415,7 @@ class PlaceholderAdmin(BaseEditableAdminMixin, admin.ModelAdmin):
         pass
 
     @xframe_options_sameorigin
+    @transaction.atomic
     def add_plugin(self, request):
         """
         Shows the add plugin form and saves it on POST.
@@ -491,7 +523,8 @@ class PlaceholderAdmin(BaseEditableAdminMixin, admin.ModelAdmin):
         if not target_language or target_language not in get_language_list():
             return HttpResponseBadRequest(_("Language must be set to a supported language!"))
 
-        copy_to_clipboard = target_placeholder.pk == request.toolbar.clipboard.pk
+        clipboard = get_toolbar_from_request(request).clipboard
+        copy_to_clipboard = clipboard is not None and target_placeholder.pk == clipboard.pk
         source_plugin_id = request.POST.get('source_plugin_id', None)
 
         if copy_to_clipboard and source_plugin_id:
@@ -527,8 +560,20 @@ class PlaceholderAdmin(BaseEditableAdminMixin, admin.ModelAdmin):
             language=source_language,
         )
         old_plugins = [source_plugin] + list(source_plugin.get_descendants())
+        source_placeholder = source_plugin.placeholder
 
         if not self.has_copy_plugins_permission(request, old_plugins):
+            message = _('You do not have permission to copy these plugins.')
+            raise PermissionDenied(message)
+
+        # Check source-side permission as well: copying reads the source
+        # plugins, so a user without access to the source placeholder must not
+        # be able to exfiltrate its content into their clipboard.
+        if not source_placeholder.has_add_plugins_permission(request.user, old_plugins):
+            message = _('You do not have permission to copy these plugins.')
+            raise PermissionDenied(message)
+
+        if not source_placeholder.check_source(request.user):
             message = _('You do not have permission to copy these plugins.')
             raise PermissionDenied(message)
 
@@ -554,6 +599,17 @@ class PlaceholderAdmin(BaseEditableAdminMixin, admin.ModelAdmin):
         old_plugins = source_placeholder.get_plugins_list(language=source_language)
 
         if not self.has_copy_plugins_permission(request, old_plugins):
+            message = _('You do not have permission to copy this placeholder.')
+            raise PermissionDenied(message)
+
+        # Check source-side permission as well: copying reads the source
+        # plugins, so a user without access to the source placeholder must not
+        # be able to exfiltrate its content into their clipboard.
+        if not source_placeholder.has_add_plugins_permission(request.user, old_plugins):
+            message = _('You do not have permission to copy this placeholder.')
+            raise PermissionDenied(message)
+
+        if not source_placeholder.check_source(request.user):
             message = _('You do not have permission to copy this placeholder.')
             raise PermissionDenied(message)
 
@@ -645,6 +701,7 @@ class PlaceholderAdmin(BaseEditableAdminMixin, admin.ModelAdmin):
         return new_plugins
 
     @xframe_options_sameorigin
+    @transaction.atomic
     def edit_plugin(self, request, plugin_id):
         try:
             plugin_id = int(plugin_id)
@@ -724,7 +781,9 @@ class PlaceholderAdmin(BaseEditableAdminMixin, admin.ModelAdmin):
         move_a_copy = (
             move_a_copy and move_a_copy != "0" and move_a_copy.lower() != "false"
         )
-        move_to_clipboard = placeholder == request.toolbar.clipboard
+        clipboard = get_toolbar_from_request(request).clipboard
+        # Both may be None, which must not be read as "moving to the clipboard".
+        move_to_clipboard = clipboard is not None and placeholder == clipboard
         source_placeholder = plugin.placeholder
 
         if placeholder and placeholder != source_placeholder:
@@ -735,26 +794,56 @@ class PlaceholderAdmin(BaseEditableAdminMixin, admin.ModelAdmin):
             except PluginLimitReached as er:
                 return HttpResponseBadRequest(er)
 
-        # True if the plugin is not being moved from the clipboard
-        # to a placeholder or from a placeholder to the clipboard.
-        move_a_plugin = not move_a_copy and not move_to_clipboard
-
         if parent_id and plugin.parent_id != parent_id:
             target_pl = placeholder or plugin.placeholder
 
-            if move_a_plugin:
-                target_parent = get_object_or_404(
-                    CMSPlugin,
-                    pk=parent_id,
-                    language=target_language,
-                    placeholder=target_pl,
-                )
-            else:
-                target_parent = get_object_or_404(CMSPlugin, pk=parent_id)
-        elif parent_id:
-            target_parent = plugin.parent
+            # The new parent must live in the placeholder (and language) the
+            # plugin ends up in. This holds for pastes and cuts just as much as
+            # for moves: ``plugin_parent`` is client supplied, so an unscoped
+            # lookup would let a user name a plugin in a placeholder they have
+            # no permission for. That both parents the new plugin outside its
+            # own placeholder and returns the foreign parent's rendered subtree
+            # in the response.
+            target_parent = get_object_or_404(
+                CMSPlugin,
+                pk=parent_id,
+                language=target_language,
+                placeholder=target_pl,
+            )
+        elif parent_id and placeholder is None:
+            # ``plugin_parent`` names the plugin's current parent. Keeping it
+            # only makes sense while the plugin stays in its placeholder; the
+            # parent does not travel to another one. It is still looked up
+            # within the plugin's own placeholder and language: a relation
+            # pointing elsewhere (e.g., created before the lookup above was
+            # scoped) must not be trusted, or its subtree ends up in the
+            # response.
+            target_parent = get_object_or_404(
+                CMSPlugin,
+                pk=parent_id,
+                language=plugin.language,
+                placeholder=plugin.placeholder_id,
+            )
         else:
             target_parent = None
+
+        # Reparenting an existing plugin under itself or one of its own
+        # descendants would create a cycle in the plugin tree. The recursive
+        # descendant/ancestor queries would then loop indefinitely, stalling
+        # request handling (denial of service). Reject such moves.
+        # (Copies and cut-to-clipboard create new plugins, so they are safe.)
+        if (
+            target_parent
+            and not move_a_copy
+            and not move_to_clipboard
+            and (
+                target_parent.pk == plugin.pk
+                or target_parent.pk in plugin._get_descendants_ids()
+            )
+        ):
+            return HttpResponseBadRequest(
+                "A plugin cannot be moved inside itself or one of its descendants."
+            )
 
         old_parent = None
         fetch_tree = True
@@ -818,6 +907,13 @@ class PlaceholderAdmin(BaseEditableAdminMixin, admin.ModelAdmin):
                       target_placeholder, target_position, target_parent=None):
         plugins = [plugin] + list(plugin.get_descendants())
 
+        # Check the source side as well: the plugin is identified by a
+        # client-supplied id, so it is not necessarily one the user is allowed
+        # to read.
+        if not self.has_paste_from_source_permission(request, plugin.placeholder, plugins):
+            message = _("You have no permission to paste this plugin")
+            raise PermissionDenied(message)
+
         if not self.has_copy_from_clipboard_permission(request, target_placeholder, plugins):
             message = _("You have no permission to paste this plugin")
             raise PermissionDenied(message)
@@ -878,6 +974,15 @@ class PlaceholderAdmin(BaseEditableAdminMixin, admin.ModelAdmin):
                            target_placeholder, target_position):
         plugins = plugin.placeholder_ref.get_plugins_list()
 
+        # Check the source side as well: the plugin is identified by a
+        # client-supplied id, so it is not necessarily one the user is allowed
+        # to read. The plugins live in the reference placeholder, but that one
+        # is only reachable through the placeholder holding the reference
+        # plugin itself (normally the user's own clipboard).
+        if not self.has_paste_from_source_permission(request, plugin.placeholder, plugins):
+            message = _("You have no permission to paste this placeholder")
+            raise PermissionDenied(message)
+
         if not self.has_copy_from_clipboard_permission(request, target_placeholder, plugins):
             message = _("You have no permission to paste this placeholder")
             raise PermissionDenied(message)
@@ -894,7 +999,7 @@ class PlaceholderAdmin(BaseEditableAdminMixin, admin.ModelAdmin):
             target_placeholder=target_placeholder,
         )
 
-        target_last_plugin = target_placeholder.get_last_plugin(plugin.language)
+        target_last_plugin = target_placeholder.get_last_plugin(target_language)
 
         if target_last_plugin:
             target_offset = target_last_plugin.position + len(plugins)
@@ -911,7 +1016,7 @@ class PlaceholderAdmin(BaseEditableAdminMixin, admin.ModelAdmin):
             start_positions={target_language: target_position},
         )
         new_plugin_ids = (new.pk for new in new_plugins)
-        target_placeholder.clear_cache(plugin.language)
+        target_placeholder.clear_cache(target_language)
 
         new_plugins = (
             CMSPlugin
@@ -1113,6 +1218,11 @@ class PlaceholderAdmin(BaseEditableAdminMixin, admin.ModelAdmin):
             "protected": protected,
             "opts": opts,
             "app_label": opts.app_label,
+            "delete_confirmation_max_display": getattr(self, "delete_confirmation_max_display", None),
+            # This view is only ever shown inside the CMS modal: render it without the
+            # admin chrome, like the other frontend editing views do.
+            "is_popup": True,
+            "is_popup_var": IS_POPUP_VAR,
         }
         request.current_app = self.admin_site.name
         return TemplateResponse(
@@ -1124,11 +1234,18 @@ class PlaceholderAdmin(BaseEditableAdminMixin, admin.ModelAdmin):
         placeholder = get_object_or_404(Placeholder, pk=placeholder_id)
         language = request.GET.get('language')
 
-        if placeholder.pk == request.toolbar.clipboard.pk:
+        clipboard = get_toolbar_from_request(request).clipboard
+
+        if clipboard is not None and placeholder.pk == clipboard.pk:
             # User is clearing the clipboard, no need for permission
             # checks here as the clipboard is unique per user.
             # There could be a case where a plugin has relationship to
             # an object the user does not have permission to delete.
+            # The clipboard is cleared immediately (the other branch
+            # renders a confirmation page first), so require POST to keep
+            # this state-changing operation off CSRF-exempt GET requests.
+            if request.method != "POST":
+                return HttpResponseNotAllowed(["POST"])
             placeholder.clear(language)
             return TemplateResponse(request, "admin/cms/page/plugin/confirm_form.html", {
                 "data_bridge": {
@@ -1205,6 +1322,11 @@ class PlaceholderAdmin(BaseEditableAdminMixin, admin.ModelAdmin):
             "protected": protected,
             "opts": opts,
             "app_label": opts.app_label,
+            "delete_confirmation_max_display": getattr(self, "delete_confirmation_max_display", None),
+            # This view is only ever shown inside the CMS modal: render it without the
+            # admin chrome, like the other frontend editing views do.
+            "is_popup": True,
+            "is_popup_var": IS_POPUP_VAR,
         }
         request.current_app = self.admin_site.name
         return TemplateResponse(request, "admin/cms/page/plugin/delete_confirmation.html", context)

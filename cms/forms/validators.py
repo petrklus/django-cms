@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
+from urllib.parse import urlsplit
 
 from django.core.exceptions import ValidationError
 from django.core.validators import RegexValidator, URLValidator
+from django.utils.html import escape
 from django.utils.safestring import mark_safe
 from django.utils.translation import gettext
 
-from cms.utils.urlutils import admin_reverse, relative_url_regex
+from cms.utils.urlutils import admin_reverse, path_segment_regex, relative_url_regex
 
 if TYPE_CHECKING:
     # Only needed for type hinting - avoid circular import
@@ -19,12 +21,58 @@ def validate_relative_url(value):
 
 
 def validate_url(value):
+    if "<" in value or ">" in value:
+        # ``relative_url_regex`` excludes angle brackets, but the absolute fallback below
+        # is Django's ``URLValidator``, whose path pattern accepts them as long as the
+        # value carries no space (``https://example.com/<script>alert(1)</script>``).
+        # Reject them before either branch runs, so markup cannot enter through a scheme.
+        raise ValidationError(
+            gettext("Enter a valid relative or absolute URL."),
+            code="invalid",
+        )
+
     try:
         # Validate relative urls first
         validate_relative_url(value)
     except ValidationError:
         # Fallback to absolute urls
         URLValidator()(value)
+    else:
+        # ``relative_url_regex`` only constrains the *characters* of a relative
+        # path, not the part before the first slash. Values such as
+        # ``javascript:alert(1)/x``, ``data:text/html,...`` or ``vbscript:.../x``
+        # therefore match the relative branch while still carrying a scheme that
+        # executes script when the value is later rendered into an ``href``
+        # (CWE-79). A genuine relative URL has no scheme, so reject any value
+        # that does. (Off-site targets such as ``https://example.com`` or
+        # ``//example.com`` are intentionally permitted -- this field allows
+        # absolute redirects -- and navigate rather than execute script.)
+        if urlsplit(value).scheme:
+            raise ValidationError(
+                gettext("Enter a valid relative or absolute URL."),
+                code="invalid",
+            )
+
+
+def validate_path_segment(value):
+    """Validate a single path segment, i.e. a path that contains no "/"."""
+    RegexValidator(
+        regex=path_segment_regex,
+        message=gettext("Enter a valid relative or absolute URL."),
+        code="invalid",
+    )(value)
+
+
+def validate_path(value):
+    """Validate a page path.
+
+    Unlike :func:`validate_url` this also accepts a single path segment such as ``contact``,
+    which ``relative_url_regex`` -- and therefore :func:`validate_url` -- never matches.
+    """
+    if "/" in value:
+        validate_url(value)
+    else:
+        validate_path_segment(value)
 
 
 def validate_url_uniqueness(
@@ -33,8 +81,9 @@ def validate_url_uniqueness(
     """Checks for conflicting urls"""
     from cms.models.pagemodel import Page, PageUrl
 
-    if "/" in path:
-        validate_url(path)
+    # Single-segment paths used to skip validation entirely, so an "Overwrite URL" without a
+    # "/" could hold arbitrary characters.
+    validate_path(path)
 
     path = path.strip("/")
     page_urls = PageUrl.objects.get_for_site(site, language=language).filter(path=path)
@@ -73,7 +122,7 @@ def validate_url_uniqueness(
     if user_language:
         change_url += f"?language={user_language}"
 
-    conflict_url = f'<a href="{change_url}" target="_blank">{str(conflict_translation.title)}</a>'
+    conflict_url = f'<a href="{change_url}" target="_blank">{escape(str(conflict_translation.title))}</a>'
 
     if exclude_page:
         message = gettext("Page %(conflict_page)s has the same url '%(url)s' as current page \"%(instance)s\".")
@@ -81,7 +130,7 @@ def validate_url_uniqueness(
         message = gettext("Page %(conflict_page)s has the same url '%(url)s' as current page.")
     message = message % {
         "conflict_page": conflict_url,
-        "url": path,
-        "instance": exclude_page.get_title(language) if exclude_page else "",
+        "url": escape(path),
+        "instance": escape(exclude_page.get_title(language)) if exclude_page else "",
     }
     raise ValidationError(mark_safe(message))

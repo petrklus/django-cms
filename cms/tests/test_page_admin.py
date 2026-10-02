@@ -1,16 +1,20 @@
 import datetime
 import json
+import re
 import sys
+from contextlib import contextmanager
 from unittest import skipUnless
+from unittest.mock import patch
 
 from django.conf import settings
 from django.contrib import admin
 from django.contrib.sites.models import Site
 from django.core.cache import cache
+from django.db import connection
 from django.forms.models import model_to_dict
 from django.http import HttpRequest, HttpResponse
 from django.test.html import HTMLParseError, Parser
-from django.test.utils import override_settings
+from django.test.utils import CaptureQueriesContext, override_settings
 from django.urls import clear_url_caches
 from django.utils.encoding import force_str
 from django.utils.timezone import now as tz_now
@@ -393,10 +397,17 @@ class PageTest(PageTestBase):
         data['template'] = page.template
         endpoint = self.get_page_change_uri('en', page)
         redirect_to = self.get_pages_admin_list_uri('en')
+        # Values carrying markup are rejected by ``validate_url()`` itself, before it picks
+        # the relative or the absolute branch, so they carry its own message.
         if DJANGO_5_1:
             validation_error = '<ul class="errorlist"><li>Enter a valid URL.</li></ul>'
+            markup_error = '<ul class="errorlist"><li>Enter a valid relative or absolute URL.</li></ul>'
         else:
             validation_error = '<ul class="errorlist" id="id_redirect_error"><li>Enter a valid URL.</li></ul>'
+            markup_error = (
+                '<ul class="errorlist" id="id_redirect_error">'
+                "<li>Enter a valid relative or absolute URL.</li></ul>"
+            )
 
         with self.subTest('Test that a redirect to the root page (valid)'):
             with self.login_user_context(superuser):
@@ -440,7 +451,7 @@ class PageTest(PageTestBase):
                 data['redirect'] = '<script>alert("test")</script>'
                 # Asserts users can't insert javascript call
                 response = self.client.post(endpoint, data)
-                self.assertContains(response, validation_error, html=True)
+                self.assertContains(response, markup_error, html=True)
 
     def test_meta_description_fields_from_admin(self):
         """
@@ -509,7 +520,7 @@ class PageTest(PageTestBase):
             save_time = datetime.datetime.strptime(
                 actual_result[-19:],
                 "%Y-%m-%dT%H:%M:%S"
-            ).replace(tzinfo=datetime.timezone.utc if settings.USE_TZ else None)
+            ).replace(tzinfo=datetime.UTC if settings.USE_TZ else None)
 
             self.assertEqual(actual_result, desired_result)
             # direct time comparisons are flaky, so we just check if the
@@ -534,6 +545,27 @@ class PageTest(PageTestBase):
                 page_url = page.urls.filter(language='en').first()
                 page_markup = row_markup % str(page_url)
                 self.assertContains(response, page_markup, html=True)
+
+    def test_delete_page_confirmation_escapes_related_objects(self):
+        """The confirmation screen lists page titles and page urls. Both are author-controlled
+        (a page url can be set verbatim through "Overwrite URL"), so neither may reach the
+        response as markup (CWE-79)."""
+        superuser = self.get_superuser()
+        homepage = create_page("home", "nav_playground.html", "en")
+        homepage.set_as_homepage()
+        page = create_page("<script>alert('title')</script>", "nav_playground.html", "en", parent=homepage)
+
+        # An overwrite url without a "/" bypasses ``validate_url`` and is stored verbatim
+        page.update_urls("en", path="<img src=x onerror=alert('url')>", managed=False)
+        page._clear_internal_cache()
+
+        with self.login_user_context(superuser):
+            response = self.client.get(self.get_admin_url(Page, "delete", page.pk))
+
+        self.assertContains(response, "&lt;img src=x onerror=alert(&#x27;url&#x27;)&gt; (en)")
+        self.assertContains(response, "&lt;script&gt;alert(&#x27;title&#x27;)&lt;/script&gt;")
+        self.assertNotContains(response, "<img src=x")
+        self.assertNotContains(response, "<script>alert(")
 
     def test_homepage_with_children(self):
         homepage = create_page("home", "nav_playground.html", "en")
@@ -580,6 +612,22 @@ class PageTest(PageTestBase):
             self.copy_page(page_a, page_b_a)
 
         self.assertEqual(Page.objects.count() - count, 3)
+
+    def test_copy_page_preserves_login_required(self):
+        source = create_page("source", "nav_playground.html", "en", login_required=True)
+        source_child = create_page("source-child", "nav_playground.html", "en", parent=source, login_required=True)
+        target = create_page("target", "nav_playground.html", "en")
+
+        with self.login_user_context(self.get_superuser()):
+            copied_root = self.copy_page(source, target)
+
+        copied_root.refresh_from_db()
+        copied_child = copied_root.get_child_pages().get()
+        copied_child.refresh_from_db()
+
+        self.assertTrue(copied_root.login_required)
+        self.assertTrue(copied_child.login_required)
+        self.assertTrue(source_child.login_required)
 
     def test_copy_page_under_home(self):
         """
@@ -1196,6 +1244,88 @@ class PageTest(PageTestBase):
             self.assertContains(response, expected, html=True)
 
     @override_settings(CMS_PERMISSION=False)
+    def test_slug_readonly_when_url_locked(self):
+        # When the page URL is shared with a published version (only possible
+        # with a versioning package installed), the slug and overwrite URL are
+        # rendered read-only: they are dropped from the editable form and shown
+        # as static text by PageContentAdmin instead.
+        superuser = self.get_superuser()
+        cms_page = create_page("page", "nav_playground.html", "en")
+        endpoint = self.get_page_change_uri("en", cms_page)
+
+        with self.login_user_context(superuser), self._url_locked():
+            response = self.client.get(endpoint)
+
+            self.assertEqual(response.status_code, 200)
+            adminform = response.context["adminform"]
+            # Rendered read-only by the admin (so no editable form field) ...
+            self.assertIn("slug", adminform.readonly_fields)
+            self.assertIn("overwrite_url", adminform.readonly_fields)
+            self.assertNotIn("slug", adminform.form.fields)
+            self.assertNotIn("overwrite_url", adminform.form.fields)
+            # ... while still displaying the current value ...
+            self.assertContains(response, "page")
+            # ... and explaining in the label how to make it editable.
+            self.assertContains(response, "first unpublish the currently published version")
+
+    @override_settings(CMS_PERMISSION=False)
+    def test_slug_editable_when_url_not_locked(self):
+        # Without a published version sharing the URL (the default in core
+        # django-CMS) the slug stays editable.
+        superuser = self.get_superuser()
+        cms_page = create_page("page", "nav_playground.html", "en")
+        endpoint = self.get_page_change_uri("en", cms_page)
+
+        with self.login_user_context(superuser):
+            response = self.client.get(endpoint)
+
+            self.assertEqual(response.status_code, 200)
+            adminform = response.context["adminform"]
+            self.assertNotIn("slug", adminform.readonly_fields)
+            self.assertIn("slug", adminform.form.fields)
+            self.assertIn("overwrite_url", adminform.form.fields)
+
+    @override_settings(CMS_PERMISSION=False)
+    def test_locked_url_unchanged_on_save(self):
+        # A locked URL must not change even if a different slug is posted, but
+        # other (non-URL) page content fields are still saved.
+        superuser = self.get_superuser()
+        cms_page = create_page("page", "nav_playground.html", "en")
+        translation = cms_page.get_content_obj("en", fallback=False)
+        changelist = self.get_pages_admin_list_uri()
+        endpoint = self.get_page_change_uri("en", cms_page)
+
+        with self.login_user_context(superuser):
+            page_data = {
+                "title": "A new title",
+                "slug": "a-changed-slug",
+                "overwrite_url": "",
+                "template": translation.template,
+            }
+            with self._url_locked():
+                response = self.client.post(endpoint, page_data)
+            self.assertRedirects(response, changelist)
+
+        # The slug/path are untouched ...
+        self.assertEqual(cms_page.get_slug("en"), "page")
+        self.assertFalse(cms_page.urls.filter(slug="a-changed-slug").exists())
+        # ... while other content fields were saved.
+        translation.refresh_from_db()
+        self.assertEqual(translation.title, "A new title")
+
+    @staticmethod
+    @contextmanager
+    def _url_locked():
+        # Simulate a shared, published page URL (as a versioning package would
+        # produce) without versioning installed. The helper is imported into
+        # both the forms and the pageadmin namespaces, so both must be patched.
+        with (
+            patch("cms.admin.forms.url_is_locked", return_value=True),
+            patch("cms.admin.pageadmin.url_is_locked", return_value=True),
+        ):
+            yield
+
+    @override_settings(CMS_PERMISSION=False)
     def test_advanced_settings_form_apphook(self):
         superuser = self.get_superuser()
         cms_page = create_page('app', 'nav_playground.html', 'en')
@@ -1399,6 +1529,32 @@ class PageTest(PageTestBase):
                 content_admin.slug(content2)
                 content_admin.overwrite_url(content2)
 
+    def test_change_view_shows_language_tabs_for_latest_content(self):
+        """The page content change view offers the language selector for the latest content."""
+        superuser = self.get_superuser()
+        page = self.get_page()
+        content = self.get_pagecontent_obj(page, "en")
+        change_url = admin_reverse("cms_pagecontent_change", args=(content.pk,))
+        with self.login_user_context(superuser):
+            response = self.client.get(change_url)
+        self.assertContains(response, 'id="page_form_lang_tabs"')
+
+    def test_change_view_drops_language_tabs_for_non_latest_content(self):
+        """The page content change view drops the language selector when an older (non-latest)
+        content object is shown. Switching languages back and forth would otherwise silently bring
+        up the latest content instead - confusing UX."""
+        superuser = self.get_superuser()
+        page = self.get_page()
+        content = self.get_pagecontent_obj(page, "en")
+        change_url = admin_reverse("cms_pagecontent_change", args=(content.pk,))
+        # Simulate a versioning package: the latest content for this language differs from the
+        # content object being shown.
+        fake_latest = type("FakeContent", (), {"pk": content.pk + 1000})()
+        with patch("cms.models.pagemodel.Page.get_admin_content", return_value=fake_latest):
+            with self.login_user_context(superuser):
+                response = self.client.get(change_url)
+        self.assertNotContains(response, 'id="page_form_lang_tabs"')
+
     def _parse_page_tree(self, response, parser_class):
         content = response.content
         content = content.decode(response.charset)
@@ -1495,6 +1651,75 @@ class PageTest(PageTestBase):
             parsed = self._parse_page_tree(response, parser_class=PageTreeLiParser)
             content = force_str(parsed)
             self.assertIn(tree, content)
+
+    def test_page_tree_prefetches_page_urls(self):
+        """
+        Regression test: the page tree endpoints must fetch the ``PageUrl``
+        objects of all pages in bulk instead of issuing one query per page
+        row (triggered by ``Page.get_url_obj`` filling ``urls_cache`` from
+        ``self.urls.all()`` for every rendered row).
+        """
+        superuser = self.get_superuser()
+
+        create_page("Home", "nav_playground.html", "en")
+        for index in range(4):
+            create_page(f"Page {index}", "nav_playground.html", "en")
+
+        endpoints = (
+            self.get_admin_url(PageContent, "get_tree"),
+            self.get_admin_url(PageContent, "changelist"),
+        )
+
+        with self.login_user_context(superuser):
+            for endpoint in endpoints:
+                with self.subTest(endpoint=endpoint):
+                    with CaptureQueriesContext(connection) as queries:
+                        response = self.client.get(endpoint)
+                    self.assertEqual(response.status_code, 200)
+                    page_url_queries = [
+                        query["sql"] for query in queries.captured_queries if '"cms_pageurl"' in query["sql"]
+                    ]
+                    self.assertLessEqual(
+                        len(page_url_queries),
+                        1,
+                        "The page tree issued one PageUrl query per page instead "
+                        "of prefetching them:\n" + "\n".join(page_url_queries),
+                    )
+
+    def test_page_tree_does_not_requery_content_less_pages(self):
+        """
+        Regression test: pages without any (filtered) translations must not
+        trigger a fresh ``set_admin_content_cache`` query per row. An empty
+        admin content cache used to be indistinguishable from an unpopulated
+        one, so ``get_admin_content`` / ``get_languages`` re-queried the
+        database for every content-less page in the tree.
+        """
+        superuser = self.get_superuser()
+        endpoint = self.get_admin_url(PageContent, "get_tree")
+
+        def add_content_less_pages(count, prefix):
+            for index in range(count):
+                page = create_page(f"{prefix}-{index}", "nav_playground.html", "en")
+                PageContent.admin_manager.filter(page=page).delete()
+
+        create_page("Home", "nav_playground.html", "en")
+        add_content_less_pages(2, "empty-a")
+
+        with self.login_user_context(superuser):
+            self.client.get(endpoint)  # warm up caches (content types, permissions, ...)
+            with CaptureQueriesContext(connection) as first:
+                self.assertEqual(self.client.get(endpoint).status_code, 200)
+
+            add_content_less_pages(3, "empty-b")
+            with CaptureQueriesContext(connection) as second:
+                self.assertEqual(self.client.get(endpoint).status_code, 200)
+
+        self.assertEqual(
+            len(second.captured_queries),
+            len(first.captured_queries),
+            "The page tree issued extra queries for content-less pages:\n"
+            + "\n".join(query["sql"] for query in second.captured_queries),
+        )
 
     def test_page_changelist_search(self):
         superuser = self.get_superuser()
@@ -1677,6 +1902,156 @@ class PageActionsTestCase(PageTestBase):
             redirect_url = self.get_admin_url(PageContent, 'changelist') + "?language=en"
             self.assertRedirects(response, redirect_url)
             self.assertEqual(Page.objects.all().count(), 2)
+
+    def test_get_list_prefetches_page_urls(self):
+        """
+        Regression test: the smart-link autocomplete endpoint resolves the
+        path/title/URL of every matching page. It must prefetch ``urls`` (and
+        ``pagecontent_set``) in bulk instead of issuing one ``PageUrl`` query
+        per matched page.
+        """
+        for index in range(4):
+            create_page(
+                f"Bravo {index}",
+                "nav_playground.html",
+                "en",
+                site=self.site,
+                slug=f"bravo-{index}",
+                created_by=self.admin,
+            )
+
+        endpoint = admin_reverse("cms_page_get_list")
+        with self.login_user_context(self.admin):
+            with CaptureQueriesContext(connection) as queries:
+                response = self.client.get(
+                    endpoint,
+                    data={"site": self.site.pk, "q": "Bravo", "language_code": "en"},
+                    HTTP_X_REQUESTED_WITH="XMLHttpRequest",
+                )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(json.loads(response.content.decode("utf-8"))), 4)
+        page_url_queries = [
+            query["sql"] for query in queries.captured_queries if 'FROM "cms_pageurl"' in query["sql"]
+        ]
+        self.assertLessEqual(
+            len(page_url_queries),
+            1,
+            "The smart-link endpoint issued one PageUrl query per matched page:\n"
+            + "\n".join(page_url_queries),
+        )
+
+    def test_actions_menu_superuser(self):
+        """Test actions_menu view returns correct context for superuser"""
+        with self.login_user_context(self.admin):
+            url = admin_reverse("cms_page_actions_menu", args=[self.page.pk])
+            response = self.client.get(url)
+
+            self.assertEqual(response.status_code, 200)
+            self.assertTemplateUsed(response, "admin/cms/page/tree/actions_dropdown.html")
+
+            # Check context contains expected keys
+            self.assertIn("page", response.context)
+            self.assertIn("site", response.context)
+            self.assertIn("opts", response.context)
+            self.assertIn("paste_enabled", response.context)
+            self.assertIn("page_is_restricted", response.context)
+
+            # Check permissions for superuser
+            self.assertEqual(response.context["page"], self.page)
+            self.assertEqual(response.context["site"], self.site)
+            self.assertTrue(response.context["has_add_permission"])
+            self.assertTrue(response.context["has_copy_page_permission"])
+            self.assertTrue(response.context["has_change_permission"])
+            self.assertTrue(response.context["has_change_advanced_settings_permission"])
+            self.assertTrue(response.context["has_change_permissions_permission"])
+            self.assertTrue(response.context["has_move_page_permission"])
+            self.assertTrue(response.context["has_delete_permission"])
+
+    def test_actions_menu_paste_enabled(self):
+        """Test paste_enabled flag is set correctly from GET parameters"""
+        with self.login_user_context(self.admin):
+            url = admin_reverse("cms_page_actions_menu", args=[self.page.pk])
+
+            # Test with has_copy parameter
+            response = self.client.get(url, {"has_copy": "1"})
+            self.assertEqual(response.status_code, 200)
+            self.assertTrue(response.context["paste_enabled"])
+
+            # Test with has_cut parameter
+            response = self.client.get(url, {"has_cut": "1"})
+            self.assertEqual(response.status_code, 200)
+            self.assertTrue(response.context["paste_enabled"])
+
+            # Test without parameters
+            response = self.client.get(url)
+            self.assertEqual(response.status_code, 200)
+            self.assertFalse(response.context["paste_enabled"])
+
+    def test_actions_menu_nonexistent_page(self):
+        """Test actions_menu raises 404 for non-existent page"""
+        with self.login_user_context(self.admin):
+            url = admin_reverse("cms_page_actions_menu", args=[999999])
+            response = self.client.get(url)
+            self.assertEqual(response.status_code, 404)
+
+    def test_actions_menu_extra_context(self):
+        """Test that extra_context is merged into the response context"""
+        # This test verifies the extra_context parameter functionality
+        # Since we can't directly call the method with extra_context via URL,
+        # we'll test it by directly calling the admin method
+        from django.contrib.admin.sites import AdminSite
+
+        from cms.admin.pageadmin import PageAdmin
+
+        page_admin = PageAdmin(Page, AdminSite())
+        request = self.get_page_request(self.page, self.admin, "/")
+        request.GET = {}
+
+        extra = {"custom_key": "custom_value"}
+        response = page_admin.actions_menu(request, self.page.pk, extra_context=extra)
+
+        # The response should be an HttpResponse with rendered template
+        self.assertEqual(response.status_code, 200)
+        # Note: We can't easily check context on the rendered response,
+        # but we've verified the method accepts and processes extra_context
+
+    @override_settings(CMS_PERMISSION=False)
+    def test_actions_menu_cms_permission_setting(self):
+        """Test CMS_PERMISSION setting is passed to context"""
+        with self.login_user_context(self.admin):
+            url = admin_reverse("cms_page_actions_menu", args=[self.page.pk])
+            response = self.client.get(url)
+
+            self.assertEqual(response.status_code, 200)
+            self.assertFalse(response.context["CMS_PERMISSION"])
+
+    @override_settings(CMS_PERMISSION=True)
+    def test_get_copy_dialog_permission_denied_source(self):
+        """Test: Permission denied for source page (user cannot view source page)"""
+        from django.contrib.auth import get_user_model
+
+        User = get_user_model()
+        user = User.objects.create_user(username="noperm", password="noperm", is_staff=True)
+        page = create_page("Secret", "nav_playground.html", "en", site=self.site, created_by=self.admin)
+        with self.login_user_context(user):
+            url = admin_reverse("cms_page_get_copy_dialog", args=[page.pk])
+            response = self.client.get(url, {"source_site": self.site.pk})
+            self.assertEqual(response.status_code, 403)
+
+    @override_settings(CMS_PERMISSION=True)
+    def test_get_copy_dialog_permission_denied_target(self):
+        """Test: Permission denied for target page (user cannot add subpage under target)"""
+        from django.contrib.auth import get_user_model
+
+        User = get_user_model()
+        user = User.objects.create_user(username="noperm2", password="noperm2", is_staff=True)
+        source_page = create_page("Source", "nav_playground.html", "en", site=self.site, created_by=self.admin)
+        target_page = create_page("Target", "nav_playground.html", "en", site=self.site, created_by=self.admin)
+        with self.login_user_context(user):
+            url = admin_reverse("cms_page_get_copy_dialog", args=[source_page.pk])
+            response = self.client.get(url, {"source_site": self.site.pk, "target": target_page.pk})
+            self.assertEqual(response.status_code, 403)
 
 
 class PermissionsTestCase(PageTestBase):

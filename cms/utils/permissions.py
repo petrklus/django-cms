@@ -58,6 +58,28 @@ def get_model_permission_codename(model, action):
     return opts.app_label + '.' + get_permission_codename(action, opts)
 
 
+def user_can_view_placeholder_source(user, source):
+    """Whether ``user`` may view the placeholders attached to ``source``.
+
+    Viewing the (read-only) structure board of a frontend-editable object
+    requires only *view* permission; mutating its plugins stays gated by
+    change permission at the plugin endpoints. This lets headless reviewers
+    inspect content structure without edit rights.
+
+    Honours a custom ``has_placeholder_view_permission`` hook on the object
+    and otherwise grants access to users holding the model/object ``view`` or
+    ``change`` permission (change implies the right to view).
+    """
+    if hasattr(source, "has_placeholder_view_permission"):
+        return source.has_placeholder_view_permission(user)
+    model = type(source)
+    perms = (
+        get_model_permission_codename(model, "view"),
+        get_model_permission_codename(model, "change"),
+    )
+    return any(user.has_perm(perm) or user.has_perm(perm, source) for perm in perms)
+
+
 def _has_global_permission(user, site, action):
     if not user.is_authenticated:
         return False
@@ -80,6 +102,103 @@ def _has_global_permission(user, site, action):
         .exists()
     )
     return has_perm
+
+
+def _global_permission_flags(queryset):
+    """OR together the ``can_*`` flags of every row in ``queryset``."""
+    flags = GlobalPagePermission.get_all_permissions()
+    granted = set()
+
+    for row in queryset.values(*flags):
+        granted.update(flag for flag in flags if row[flag])
+    return granted
+
+
+def _managed_global_permission_flags(queryset):
+    """Like :func:`_global_permission_flags`, but empty without ``can_change_permissions``.
+
+    Holding a flag on a site is not enough to hand it out there: the user must
+    also be allowed to manage permissions on that site.
+    """
+    granted = _global_permission_flags(queryset)
+    return granted if "can_change_permissions" in granted else set()
+
+
+def get_grantable_global_permissions(user, site_ids=None):
+    """Return the ``can_*`` flags ``user`` may hand out through a global permission.
+
+    A delegated permission manager must never grant a right they do not hold
+    themselves (see ``docs/explanation/permissions.rst``), so what is grantable
+    depends on the sites the grant would cover:
+
+    * ``site_ids=None`` -- the union of the flags the user holds on any site.
+      The widest set they could ever grant, used to decide which fields to
+      offer at all.
+    * ``site_ids=[]`` -- an empty ``GlobalPagePermission.sites`` means "every
+      site", so granting requires an equally unrestricted grant of the flag.
+    * a non-empty list -- the flags held on *every* one of those sites. A flag
+      held on one site alone cannot be used to grant it on another.
+
+    For ``[]`` and a list of sites, nothing is grantable on a site where the user
+    lacks ``can_change_permissions``, so ``"can_change_permissions" in result``
+    tells whether the user may manage permissions on all of those sites.
+
+    In every case a flag is only grantable if the user also holds the Django
+    model permissions that page actions require alongside it.
+    """
+    all_flags = set(GlobalPagePermission.get_all_permissions())
+
+    if not user or not user.is_authenticated:
+        return set()
+
+    if user.is_superuser or not get_cms_setting('PERMISSION'):
+        return all_flags
+
+    if site_ids is None:
+        held = _global_permission_flags(GlobalPagePermission.objects.with_user(user))
+    elif not site_ids:
+        held = _managed_global_permission_flags(
+            GlobalPagePermission.objects.with_user(user).filter(sites__isnull=True)
+        )
+    else:
+        held = all_flags
+        for site_id in site_ids:
+            held &= _managed_global_permission_flags(
+                GlobalPagePermission.objects.get_with_site(user, site_id)
+            )
+            if not held:
+                break
+    return held & _flags_with_django_permissions(user)
+
+
+# ``can_view`` has no Django permission counterpart: viewing restricted pages
+# is governed by CMS permissions alone.
+_global_permission_actions = {
+    "can_add": "add_page",
+    "can_change": "change_page",
+    "can_delete": "delete_page",
+    "can_publish": "publish_page",
+    "can_change_advanced_settings": "change_page_advanced_settings",
+    "can_change_permissions": "change_page_permissions",
+    "can_move_page": "move_page",
+}
+
+
+def _flags_with_django_permissions(user):
+    """Return the ``can_*`` flags whose Django model permissions ``user`` holds.
+
+    A CMS flag alone does not let a user act: the page permission checks also
+    require the corresponding Django permissions (``auth_permission_required``).
+    A manager holding the flag but not the Django permission does not have the
+    right, so they must not be able to hand it out either.
+    """
+    from cms.utils.page_permissions import _django_permissions_by_action
+
+    return {
+        flag for flag in GlobalPagePermission.get_all_permissions()
+        if flag not in _global_permission_actions
+        or user.has_perms(_django_permissions_by_action[_global_permission_actions[flag]])
+    }
 
 
 def user_can_add_global_permissions(user, site):
@@ -251,6 +370,10 @@ def get_subordinate_users(user, site):
     If user haves global permissions or is a superuser, then he can see all the
     users.
 
+    Superusers are never subordinate to a non-superuser, no matter how many
+    permissions the latter holds. Otherwise a delegated administrator could
+    manage - and take over - a superuser account.
+
     This function is currently used in PagePermissionInlineAdminForm for limit
     users in permission combobox.
 
@@ -269,6 +392,13 @@ def get_subordinate_users(user, site):
     """
     from cms.utils.page_permissions import get_change_permissions_perm_tuples
 
+    def without_superusers(qs):
+        # A non-superuser must never be handed a superuser as a subordinate:
+        # being able to manage the account means being able to take it over.
+        if user.is_superuser:
+            return qs
+        return qs.exclude(is_superuser=True)
+
     try:
         user_level = get_user_permission_level(user, site)
     except NoPermissionsException:
@@ -279,10 +409,10 @@ def get_subordinate_users(user, site):
             Q(is_staff=True) & Q(pageuser__created_by=user) & Q(pagepermission__page=None)
         )
         qs = qs.exclude(pk=user.pk).exclude(groups__user__pk=user.pk)
-        return qs
+        return without_superusers(qs)
 
     if user_level == ROOT_USER_LEVEL:
-        return get_user_model().objects.all()
+        return without_superusers(get_user_model().objects.all())
 
     from cms.models import PermissionTuple
     allow_list = Q()
@@ -298,7 +428,7 @@ def get_subordinate_users(user, site):
         )
     )
     qs = qs.exclude(pk=user.pk).exclude(groups__user__pk=user.pk)
-    return qs
+    return without_superusers(qs)
 
 
 def get_subordinate_groups(user, site):

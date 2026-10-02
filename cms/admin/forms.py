@@ -21,7 +21,7 @@ from cms.constants import PAGE_TYPES_ID, ROOT_USER_LEVEL
 from cms.exceptions import PluginLimitReached
 from cms.extensions import extension_pool
 from cms.forms.fields import PageSmartLinkField
-from cms.forms.validators import validate_relative_url, validate_url_uniqueness
+from cms.forms.validators import validate_path, validate_relative_url, validate_url_uniqueness
 from cms.forms.widgets import (
     AppHookSelect,
     ApplicationConfigSelect,
@@ -51,8 +51,16 @@ from cms.utils.compat.warnings import RemovedInDjangoCMS51Warning
 from cms.utils.conf import get_cms_setting
 from cms.utils.i18n import get_language_list, get_site_language_from_request
 from cms.utils.page import get_clean_username
+from cms.utils.page_permissions import (
+    user_can_add_page,
+    user_can_add_subpage,
+    user_can_change_page,
+    user_can_view_page,
+)
 from cms.utils.permissions import (
     get_current_user,
+    get_grantable_global_permissions,
+    get_model_permission_codename,
     get_subordinate_groups,
     get_subordinate_users,
     get_user_permission_level,
@@ -268,6 +276,7 @@ class AddPageForm(BasePageContentForm):
     content_defaults = {
         "in_navigation": get_cms_setting("DEFAULT_IN_NAVIGATION"),
     }
+    source_permission_denied = _("You do not have permission to use this page type.")
 
     class Meta:
         model = PageContent
@@ -276,15 +285,14 @@ class AddPageForm(BasePageContentForm):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
+        page_field = self.fields.get("cms_page")
+        if page_field:
+            page_field.queryset = page_field.queryset.filter(site=self._site)
+
         source_field = self.fields.get("source")
 
         if not source_field or source_field.widget.is_hidden:
             return
-
-        page_field = self.fields.get("cms_page")
-
-        if page_field:
-            page_field.queryset = page_field.queryset.filter(site=self._site)
 
         root_page = PageType.get_root_page(site=self._site)
 
@@ -294,8 +302,13 @@ class AddPageForm(BasePageContentForm):
             titles = PageContent.objects.filter(page__in=descendants, language=self._language)
             choices = [("", "---------")]
             choices.extend((title.page_id, title.title) for title in titles)
+            # Narrow the queryset and not just the choices: ``source`` is validated
+            # against the queryset, which otherwise spans the page types of every
+            # site, while the choices are merely what the widget renders.
+            source_field.queryset = descendants
             source_field.choices = choices
         else:
+            source_field.queryset = source_field.queryset.none()
             choices = []
 
         if len(choices) < 2:
@@ -307,6 +320,12 @@ class AddPageForm(BasePageContentForm):
         if self._errors:
             # Form already has errors, best to let those be
             # addressed first.
+            return data
+
+        if data.get("cms_page") and data.get("source"):
+            # Translations reuse an existing page and skip from_source(), where
+            # the source's view restrictions are preserved before copying content.
+            self.add_error("source", _("A source page cannot be used when adding a translation."))
             return data
 
         parent_page = data.get("parent_page")
@@ -331,11 +350,45 @@ class AddPageForm(BasePageContentForm):
             data["path"] = path
         return data
 
+    def clean_source(self):
+        source = self.cleaned_data.get("source")
+        # ``source`` is a hidden field whose value is fully controlled by the
+        # client on POST and ``has_add_permission`` only checks that the user may
+        # create *a* page, not that they may read ``source`` -- whose placeholders,
+        # plugins and extensions ``save()`` copies into the new page.
+        if source and not user_can_view_page(self._user, source, site=source.site):
+            raise ValidationError(self.source_permission_denied)
+        return source
+
     def clean_parent_page(self):
         parent_page = self.cleaned_data.get("parent_page")
         if parent_page and parent_page.site_id != self._site.pk:
             raise ValidationError("Site doesn't match the parent's page site")
+
+        if self.cleaned_data.get("cms_page"):
+            # A translation is added to an existing page, the parent is not used.
+            # ``clean_cms_page`` checks the permission on that page instead.
+            return parent_page
+
+        # ``parent_page`` is a hidden field whose value is fully controlled by the
+        # client on POST, while ``has_add_permission`` only validated the parent
+        # taken from the query string. Re-check the permission against the parent
+        # the page is actually created under -- this is to prevent people from
+        # possible form-hacking.
+        if parent_page:
+            has_perm = user_can_add_subpage(self._user, target=parent_page, site=self._site)
+        else:
+            has_perm = user_can_add_page(self._user, site=self._site)
+
+        if not has_perm:
+            raise ValidationError(_("You do not have permission to add a page here."))
         return parent_page
+
+    def clean_cms_page(self):
+        page = self.cleaned_data.get("cms_page")
+        if page and not user_can_change_page(self._user, page, site=page.site):
+            raise ValidationError(_("You do not have permission to change this page."))
+        return page
 
     def create_translation(self, page, main_language_page_content_template=None):
         data = self.cleaned_data
@@ -375,6 +428,10 @@ class AddPageForm(BasePageContentForm):
             user=self._user,
         )
         new_page.update(is_page_type=False)
+        # ``Page.copy()`` is called with ``permissions=False``, so a copy of a
+        # view-restricted source would be world-readable. Carry the source's view
+        # restrictions -- its own and the ones it inherits -- over to the copy.
+        new_page.apply_view_restrictions(source.get_view_restrictions(), user=self._user)
         return new_page
 
     def get_template(self):
@@ -512,10 +569,56 @@ class AddPageTypeForm(AddPageForm):
 
 
 class DuplicatePageForm(AddPageForm):
+    source_permission_denied = _("You do not have permission to copy this page.")
+
     source = forms.ModelChoiceField(
         queryset=Page.objects.all(),
         required=True,
         widget=forms.HiddenInput(),
+    )
+
+    def clean_source(self):
+        source = self.cleaned_data.get("source")
+        # ``source`` is a hidden field whose value is fully controlled by the
+        # client on POST and whose queryset spans every page on every site.
+        # ``has_add_permission`` only checks that the user may create *a* page,
+        # not that they may read ``source``. Without an explicit object-level
+        # check, a staff user with only "add page" rights could duplicate (and
+        # thereby read the plugin content of) any page -- bypassing per-page
+        # view restrictions and multi-site isolation (CWE-639 / CWE-862).
+        # ``copy(..., permissions=False)`` even strips the source's view
+        # restrictions, leaving the copy fully readable. Require that the user
+        # is actually allowed to view the page they are copying.
+        if source and not user_can_view_page(self._user, source, site=source.site):
+            raise ValidationError(self.source_permission_denied)
+        return source
+
+    def from_source(self, source, parent=None):
+        new_page = super().from_source(source, parent=parent)
+        # ``Page.copy()`` is called with ``permissions=False``, so a duplicate of
+        # a view-restricted page would be world-readable. Carry the source's view
+        # restrictions -- its own and the ones it inherits -- over to the copy.
+        new_page.apply_view_restrictions(source.get_view_restrictions(), user=self._user)
+        return new_page
+
+
+def url_is_locked(page_content: PageContent) -> bool:
+    """Return whether ``page_content``'s URL is shared with a published
+    (publicly visible) version of the same page and language.
+
+    With a versioning package installed the slug and path live on the
+    (unversioned) :class:`~cms.models.pagemodel.PageUrl` and are therefore
+    shared across all versions of a page. Editing the slug of a draft would
+    silently change the URL of the already published version. Without versioning
+    the content being edited *is* the public version, so the URL is never
+    locked.
+    """
+    if page_content is None or page_content.pk is None:
+        return False
+    return (
+        PageContent.objects.filter(page=page_content.page_id, language=page_content.language)
+        .values_list("pk", flat=True)
+        .exclude(pk=page_content.pk).exists()
     )
 
 
@@ -601,9 +704,31 @@ class ChangePageForm(BasePageContentForm):
         if not self.url_obj.managed:
             self.fields["overwrite_url"].initial = self.url_obj.path
 
+        if self._url_is_locked:
+            # The URL is shared with a published version of this page (only
+            # possible with a versioning package installed). Changing the slug
+            # or overwrite URL would silently change the live URL, so drop those
+            # fields from the editable form. PageContentAdmin renders them as
+            # read-only instead (see PageContentAdmin.get_readonly_fields()).
+            self.fields.pop("slug", None)
+            self.fields.pop("overwrite_url", None)
+
+    @cached_property
+    def _url_is_locked(self):
+        return url_is_locked(self.instance)
+
     @cached_property
     def _language(self):
         return self.instance.language
+
+    def clean_overwrite_url(self):
+        path = (self.cleaned_data.get("overwrite_url") or "").strip("/")
+        if path:
+            # Validate the characters here rather than in ``clean()``: that method returns early
+            # for the home page and for pages without a reachable path, but the value is persisted
+            # either way and becomes the live url as soon as the page stops being home.
+            validate_path(path)
+        return self.cleaned_data["overwrite_url"]
 
     def clean(self):
         data = super().clean()
@@ -614,6 +739,10 @@ class ChangePageForm(BasePageContentForm):
             return data
 
         page = self.instance.page
+
+        if self._url_is_locked:
+            # The slug and overwrite URL are read-only; the URL must not change.
+            return data
 
         if page.is_home:
             data["path"] = ""
@@ -683,16 +812,19 @@ class ChangePageForm(BasePageContentForm):
             changed_date=timezone.now(),
             **data,
         )
-        page.update_urls(
-            self._language,
-            path=page_path,
-            slug=page_slug,
-            managed=not bool(page_overwrite_url),
-        )
-        page._update_url_path_recursive(self._language)
+        if not self._url_is_locked:
+            # When the URL is shared with a published version the slug/path must
+            # not change, so the (read-only) URL fields are ignored on save.
+            page.update_urls(
+                self._language,
+                path=page_path,
+                slug=page_slug,
+                managed=not bool(page_overwrite_url),
+            )
+            page._update_url_path_recursive(self._language)
         page.clear_cache(menu=True)
 
-        if page.application_urls and "slug" in self.changed_data:
+        if not self._url_is_locked and page.application_urls and "slug" in self.changed_data:
             # Connects the apphook restart handler to the request finished signal
             set_restart_trigger()
         send_post_page_operation(
@@ -1003,8 +1135,8 @@ class MovePageForm(PageTreeForm):
         # The user is moving from right to left.
         return target_page, "left"
 
-    def move_page(self):
-        self.page.move_page(*self.get_tree_options())
+    def move_page(self, user=None):
+        self.page.move_page(*self.get_tree_options(), user=user)
 
     def _determine_new_parent(self, target_page, position):
         if position in ("first-child", "last-child"):
@@ -1012,7 +1144,11 @@ class MovePageForm(PageTreeForm):
         return target_page.parent
 
     def _validate_slug_uniqueness(self, parent, language, slug):
-        target_siblings = Page.objects.filter(parent=parent).exclude(pk=self.page.pk)
+        target_siblings = Page.objects.filter(
+            parent=parent,
+            site=self._site,
+            is_page_type=self.page.is_page_type,
+        ).exclude(pk=self.page.pk)
         if target_siblings.filter(urls__slug=slug, urls__language=language).exists():
             raise ValidationError(
                 _(
@@ -1220,6 +1356,21 @@ class ViewRestrictionInlineAdminForm(BasePermissionAdminForm):
 
 
 class GlobalPagePermissionAdminForm(BasePermissionAdminForm):
+    """Admin form for site-wide page permissions.
+
+    Unlike :class:`PagePermissionInlineAdminForm`, whose admin restricts the
+    rendered ``can_*`` flags in ``PagePermissionInlineAdmin.get_formset``, this
+    form is the only place where the "a manager cannot hand out rights they do
+    not hold themselves" invariant (see ``docs/explanation/permissions.rst``)
+    can be enforced for :class:`~cms.models.GlobalPagePermission`.
+
+    Without it, a delegate whose sole elevated right is ``can_change_permissions``
+    could grant themselves ``can_publish``, ``can_delete``,
+    ``can_change_advanced_settings`` and ``can_move_page`` site-wide (CWE-269).
+    """
+
+    _current_user = None
+
     class Meta:
         fields = [
             "user",
@@ -1235,6 +1386,73 @@ class GlobalPagePermissionAdminForm(BasePermissionAdminForm):
             "sites",
         ]
         model = GlobalPagePermission
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        if not self.instance.pk:
+            return
+
+        # ``GlobalPagePermissionAdmin.get_form`` excludes the flags the manager
+        # may not grant, and ``BasePermissionAdminForm`` then blanks every
+        # excluded flag on the instance. That is right for a new row -- several
+        # ``can_*`` flags default to ``True`` on the model -- but on an existing
+        # one it would silently *revoke* rights the manager is equally
+        # unauthorized to touch, so restore the stored values here.
+        stored = (
+            self._meta.model._base_manager.filter(pk=self.instance.pk)
+            .values(*self._meta.model.get_all_permissions())
+            .first()
+        )
+        for field, value in (stored or {}).items():
+            if field not in self.fields:
+                setattr(self.instance, field, value)
+
+    def clean(self):
+        cleaned_data = super().clean()
+
+        user = self._current_user or get_current_user()
+        if user is None:
+            # No acting user means the form is used outside an admin request --
+            # a script, data migration or test -- where there is no privilege
+            # boundary to enforce. ``GlobalPagePermissionAdmin.get_form`` always
+            # sets ``_current_user``, so the admin never takes this path.
+            return cleaned_data
+
+        # ``sites`` is excluded from ``cleaned_data`` when it failed validation;
+        # falling back to "all sites" then applies the strictest check.
+        site_ids = [site.pk for site in cleaned_data.get("sites") or []]
+        grantable = get_grantable_global_permissions(user, site_ids)
+
+        if "can_change_permissions" not in grantable:
+            # ``has_add_permission`` only checks the current site; a manager must
+            # be allowed to manage permissions on every site the grant covers.
+            self.add_error(
+                "sites" if "sites" in self.fields else None,
+                forms.ValidationError(
+                    _("You cannot manage permissions on every selected site."),
+                    code="sites_not_managed",
+                ),
+            )
+            return cleaned_data
+
+        for field in self._meta.model.get_all_permissions():
+            # Fields absent from the form were already excluded as ungrantable
+            # on any site; this catches the narrower case of a flag the manager
+            # holds on one site being granted for another.
+            if field in self.fields and cleaned_data.get(field) and field not in grantable:
+                self.add_error(
+                    field,
+                    forms.ValidationError(
+                        _(
+                            'You cannot grant "%(permission)s" because you do not hold it '
+                            "yourself on every selected site."
+                        ),
+                        code="permission_not_held",
+                        params={"permission": self.fields[field].label or field},
+                    ),
+                )
+        return cleaned_data
 
 
 class GenericCmsPermissionForm(forms.ModelForm):
@@ -1255,6 +1473,11 @@ class GenericCmsPermissionForm(forms.ModelForm):
     can_add_pagepermission = forms.BooleanField(label=_("Add"), required=False)
     can_change_pagepermission = forms.BooleanField(label=_("Change"), required=False)
     can_delete_pagepermission = forms.BooleanField(label=_("Delete"), required=False)
+
+    # Maps the ``can_<action>_<name>`` permission fields to the model whose
+    # permission they grant. Mirrors ``save_permissions`` and the fieldsets
+    # rendered by ``PageUserGroupAdmin``/``PageUserAdmin``.
+    _permission_models = ((Page, "page"), (PageUser, "pageuser"), (PagePermission, "pagepermission"))
 
     def __init__(self, *args, **kwargs):
         instance = kwargs.get("instance")
@@ -1312,6 +1535,33 @@ class GenericCmsPermissionForm(forms.ModelForm):
                     "to change permissions. Edit permissions required."
                 )
                 raise ValidationError(message)
+
+        # Enforce "nobody can grant more than they have" at the data layer.
+        self._drop_unauthorized_permissions(data)
+        return data
+
+    def _drop_unauthorized_permissions(self, data):
+        """Remove ``can_*`` entries the current manager is not allowed to manage.
+
+        ``PageUserGroupAdmin.get_fieldsets`` only *renders* the permission
+        checkboxes the manager actually holds, but the ``can_*`` fields are
+        declared on this form and therefore stay in ``base_fields`` regardless
+        of the admin's ``fields=`` restriction. A crafted POST can set the
+        hidden ones, and ``save_permissions`` would then grant them -- letting a
+        delegated manager escalate a group beyond their own rights (CWE-269).
+        Dropping the unauthorized entries here means they are neither granted
+        nor revoked, so any existing value the manager may not touch is left
+        untouched as well.
+        """
+        user = self._current_user
+        for model, name in self._permission_models:
+            for action in ("add", "change", "delete"):
+                field = f"can_{action}_{name}"
+                if field not in self.fields:
+                    continue
+                if user is None or not user.has_perm(get_model_permission_codename(model, action)):
+                    data.pop(field, None)
+        return data
 
     def populate_initials(self, obj):
         """Read out permissions from permission system."""

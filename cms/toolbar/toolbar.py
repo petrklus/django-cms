@@ -1,6 +1,7 @@
 import functools
 import operator
 from collections import OrderedDict
+from urllib.parse import urlparse
 
 from classytags.utils import flatten_context
 from django.apps import apps
@@ -210,9 +211,25 @@ class CMSToolbarBase(BaseToolbar):
             )
             self.toolbars[key] = toolbar
 
+    @staticmethod
+    def _get_request_path(request):
+        # The viewed page path, reported via the ``cms_path`` GET query on
+        # asynchronous toolbar/structure requests, falls back to the actual
+        # request path for regular page requests.
+        cms_path = request.GET.get('cms_path')
+        if cms_path:
+            return urlparse(cms_path).path
+        return request.path_info
+
     def init_toolbar(self, request, request_path=None):
         self.request = request
-        self.request_path = request_path or request.path_info  # TODO: Used to be request.path. Why?
+        # ``request_path`` is the path of the page the user is *viewing*. For regular
+        # page requests this is identical to ``request.path_info``. For asynchronous
+        # toolbar/structure requests, however, ``request.path_info`` points at an
+        # internal admin/AJAX endpoint while the viewed page is reported via the
+        # ``cms_path`` GET query. Honour ``cms_path`` so that everything relying on
+        # ``request_path`` (e.g. the language menu) builds URLs for the viewed page.
+        self.request_path = request_path or self._get_request_path(request)
         self.is_staff = self.request.user.is_staff
         self.show_toolbar = self.is_staff
 
@@ -600,9 +617,24 @@ class EmptyToolbar(BaseToolbar):
 
     _cache_disabled = True
 
+    #: No toolbar means no user settings, hence no clipboard. Mirrors the initial
+    #: value on ``CMSToolbarBase`` so that callers can rely on the attribute
+    #: existing and only have to handle ``None``.
+    clipboard = None
+
     def __init__(self, request):
         self.request = request
         super().__init__()
+
+    @cached_property
+    def toolbar_language(self):
+        # There are no user settings to take a preferred language from, so the
+        # request language is the best available answer.
+        return self.request_language
+
+    @cached_property
+    def toolbar_language_bidi(self):
+        return self.toolbar_language in settings.LANGUAGES_BIDI
 
     def get_object(self):
         return None

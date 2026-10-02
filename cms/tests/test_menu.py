@@ -3,14 +3,16 @@ import copy
 from django.conf import settings
 from django.contrib.auth.models import AnonymousUser, Group, Permission
 from django.contrib.sites.models import Site
+from django.core.cache import caches
+from django.db import connection
 from django.template import Template, TemplateSyntaxError
 from django.template.context import Context
-from django.test.utils import override_settings
+from django.test.utils import CaptureQueriesContext, override_settings
 from django.utils.translation import activate, override as force_language
 
 from cms.api import create_page, create_page_content
 from cms.apphook_pool import apphook_pool
-from cms.cms_menus import get_visible_page_contents
+from cms.cms_menus import CMSMenu, get_visible_page_contents
 from cms.models import ACCESS_PAGE_AND_DESCENDANTS, Page, PageContent
 from cms.models.permissionmodels import GlobalPagePermission, PagePermission
 from cms.test_utils.fixtures.menus import (
@@ -1208,6 +1210,53 @@ class MenuTests(BaseMenuTest):
         expected_language = get_default_language_for_site(site.pk)
         self.assertEqual(renderer.request_language, expected_language)
 
+    def test_cmsnavigationnode_attr(self):
+        """
+        Test population of the attr object of the CMSNavigationNode from pages
+        """
+        page_defaults = {
+            "template": "nav_playground.html",
+            "language": "en",
+        }
+        home = create_page("Normal Page", in_navigation=True, reverse_id="normal-page", **page_defaults)
+        home.set_as_homepage()
+        create_page("Redirected Page", in_navigation=True, reverse_id="redirected-page", redirect='https://redirect.example.com', **page_defaults)
+
+        request = self.get_request("/en/")
+        context = Context()
+        context["request"] = request
+        tpl = Template("{% load menu_tags %}{% show_menu 0 100 100 100 %}")
+        tpl.render(context)
+        nodes = context["children"]
+
+        expected_normal_attr = {
+            "is_page": True,
+            "soft_root": False,
+            "redirect_url": None,
+            "auth_required": False,
+            "reverse_id": "normal-page",
+            "is_home": True,
+            "visible_for_authenticated": True,
+            "visible_for_anonymous": True,
+            "navigation_extenders": [],
+        }
+
+        expected_redirect_attr = {
+            "is_page": True,
+            "soft_root": False,
+            "redirect_url": "https://redirect.example.com",
+            "auth_required": False,
+            "reverse_id": "redirected-page",
+            "is_home": False,
+            "visible_for_authenticated": True,
+            "visible_for_anonymous": True,
+            "navigation_extenders": [],
+        }
+
+        self.assertEqual(2, len(nodes))
+        self.assertEqual(expected_normal_attr, nodes[0].attr)
+        self.assertEqual(expected_redirect_attr, nodes[1].attr)
+
 
 @override_settings(CMS_PERMISSION=False)
 class AdvancedSoftrootTests(SoftrootFixture, CMSTestCase):
@@ -1840,6 +1889,52 @@ class PublicViewPermissionMenuTests(CMSTestCase):
         page_contents = get_visible_page_contents(self.request, page_contents, self.site)
         titles = [page_content.title for page_content in page_contents]
         self.assertSequenceEqual(sorted(titles), ["a", "b1", "c1", "c2"])
+
+
+@override_settings(
+    CMS_PERMISSION=True,
+    CMS_PUBLIC_FOR="all",
+)
+class ViewPermissionMenuQueryTests(CMSTestCase):
+    """
+    Regression tests: building the menu must not run one query per page.
+
+    ``CMSMenu.get_nodes`` restricts the loaded fields with ``only()``. Every
+    field accessed by the view-restriction check in
+    ``get_visible_page_contents`` (such as ``page.path``) has to be part of
+    that ``only()`` call, otherwise each page triggers an extra query to
+    load the deferred field.
+    """
+
+    template = "nav_playground.html"
+
+    def _get_menu_query_count(self):
+        request = self.get_request("/")
+        renderer = menu_pool.get_renderer(request)
+        menu = CMSMenu(renderer)
+        with CaptureQueriesContext(connection) as queries:
+            menu.get_nodes(request)
+        return len(queries.captured_queries)
+
+    def test_number_of_queries_does_not_scale_with_page_count(self):
+        create_page("home", self.template, "en", in_navigation=True)
+        restricted = create_page("restricted", self.template, "en", in_navigation=True)
+        PagePermission.objects.create(
+            page=restricted,
+            user=self.get_standard_user(),
+            can_view=True,
+            grant_on=ACCESS_PAGE_AND_DESCENDANTS,
+        )
+        for index in range(3):
+            create_page(f"page-{index}", self.template, "en", in_navigation=True)
+
+        self._get_menu_query_count()  # warm up caches (site, content types, ...)
+        query_count = self._get_menu_query_count()
+
+        for index in range(5):
+            create_page(f"extra-{index}", self.template, "en", in_navigation=True)
+
+        self.assertEqual(self._get_menu_query_count(), query_count)
 
 
 @override_settings(CMS_PERMISSION=False)

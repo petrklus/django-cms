@@ -15,7 +15,7 @@ from django.http import (
 from django.shortcuts import render
 from django.template.defaultfilters import title
 from django.template.response import TemplateResponse
-from django.urls import Resolver404, resolve, reverse
+from django.urls import NoReverseMatch, Resolver404, resolve, reverse
 from django.utils.cache import patch_cache_control
 from django.utils.http import url_has_allowed_host_and_scheme
 from django.utils.timezone import now
@@ -23,6 +23,7 @@ from django.utils.translation import activate
 from django.views.decorators.http import require_POST
 
 from cms.apphook_pool import apphook_pool
+from cms.appresolver import applications_page_check
 from cms.cache.page import get_page_cache
 from cms.exceptions import LanguageError
 from cms.forms.login import CMSToolbarLoginForm
@@ -46,6 +47,8 @@ from cms.utils.i18n import (
     is_language_prefix_patterns_used,
 )
 from cms.utils.page import get_page_from_request
+from cms.utils.page_permissions import user_can_view_page
+from cms.utils.permissions import user_can_view_placeholder_source
 from cms.utils.placeholder import get_declared_placeholders_for_obj, get_placeholder_conf
 
 
@@ -254,8 +257,19 @@ def render_object_structure(request, content_type_id, object_id):
         if issubclass(content_type.model_class(), PageContent):
             content_type_obj = PageContent._base_manager.select_related("page").get(pk=object_id)
             request.current_page = content_type_obj.page
+            # Enforce the same page-view permission as the edit and preview
+            # endpoints (which check it via render_page()). Without this, a
+            # staff user who cannot view a restricted page could still read its
+            # plugin structure through this endpoint.
+            if not user_can_view_page(request.user, content_type_obj.page):
+                raise Http404
         else:
             content_type_obj = content_type.get_object_for_this_type(pk=object_id)
+            # Viewing the structure board requires only view permission (as the
+            # page branch above does via user_can_view_page). Mutations remain
+            # gated by change permission at the plugin endpoints.
+            if not user_can_view_placeholder_source(request.user, content_type_obj):
+                raise Http404
     except ObjectDoesNotExist as err:
         raise Http404 from err
 
@@ -315,8 +329,31 @@ def render_object_endpoint(request, content_type_id, object_id, require_editable
                     return _handle_no_apphook(request)
         else:
             content_type_obj = content_type.get_object_for_this_type(pk=object_id)
+            # Enforce the same object-level view check as the structure endpoint
+            # (and, for the page branch above, render_page()'s user_can_view_page).
+            # Without this, any staff user could read the rendered plugin content
+            # of any frontend-editable object. Mutations remain gated by change
+            # permission at the plugin endpoints.
+            if not user_can_view_placeholder_source(request.user, content_type_obj):
+                raise Http404
     except ObjectDoesNotExist as err:
         raise Http404 from err
+
+    # Attempt to resolve current_page via the object's absolute URL (for apphooks)
+    if not getattr(request, "current_page", None):
+        try:
+            object_url = content_type_obj.get_absolute_url()
+        except (AttributeError, NoReverseMatch):
+            object_url = None
+
+        if object_url:
+            original_path_info = request.path_info
+            try:
+                # Temporarily patch the request object and use the appresolver
+                request.path_info = object_url
+                request.current_page = applications_page_check(request)
+            finally:
+                request.path_info = original_path_info
 
     extension = apps.get_app_config('cms').cms_extension
 

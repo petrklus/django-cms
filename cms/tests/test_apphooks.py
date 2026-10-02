@@ -1,15 +1,20 @@
 import sys
 
+from django.apps import apps
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Permission
+from django.contrib.contenttypes.models import ContentType
 from django.contrib.sites.models import Site
 from django.core import checks
 from django.core.cache import cache
 from django.core.checks.urls import check_url_config
+from django.http import Http404, HttpResponse
+from django.template import Context, Template
+from django.test import RequestFactory
 from django.test.utils import override_settings
 from django.urls import NoReverseMatch, clear_url_caches, resolve, reverse
 from django.utils.timezone import now
-from django.utils.translation import override as force_language
+from django.utils.translation import activate, override as force_language
 
 from cms.admin.forms import AdvancedSettingsForm
 from cms.api import create_page, create_page_content
@@ -22,6 +27,7 @@ from cms.test_utils.project.placeholderapp.models import Example1
 from cms.test_utils.testcases import CMSTestCase
 from cms.tests.test_menu_utils import DumbPageLanguageUrl
 from cms.toolbar.toolbar import CMSToolbar
+from cms.views import render_object_edit
 from menus.menu_pool import menu_pool
 from menus.utils import DefaultLanguageChanger
 
@@ -31,7 +37,7 @@ APP_MODULE = "cms.test_utils.project.sampleapp.cms_apps"
 MENU_MODULE = "cms.test_utils.project.sampleapp.cms_menus"
 
 
-class ApphooksTestCase(CMSTestCase):
+class BaseApphooksTestCase(CMSTestCase):
     def setUp(self):
         clear_app_resolvers()
         clear_url_caches()
@@ -100,6 +106,8 @@ class ApphooksTestCase(CMSTestCase):
 
         return contents
 
+
+class ApphooksTestCase(BaseApphooksTestCase):
     @override_settings(ROOT_URLCONF='cms.test_utils.project.fourth_urls_for_apphook_tests')
     def test_check_url_config(self):
         """
@@ -568,6 +576,33 @@ class ApphooksTestCase(CMSTestCase):
             resolver = urlpatterns[0]
             url = resolver.reverse('sample-root')
             self.assertEqual(url, 'child/not-home/subchild/')
+
+    @override_settings(CMS_PERMISSION=False, ROOT_URLCONF='cms.test_utils.project.urls_2')
+    def test_apphook_on_page_without_path_is_skipped(self):
+        """A page whose ``PageUrl.path`` is ``None`` must not break url resolution.
+
+        Regression test for #8886: ``_get_app_patterns`` built ``page_url.path + "/"``
+        unconditionally, so a single such page raised ``TypeError`` and took down every
+        apphook on the site -- including the admin -- until the database was edited by hand.
+        Unpublishing a page with djangocms-versioning leaves exactly this state.
+        """
+        home = self.create_homepage("home", "nav_playground.html", "en")
+        create_page("live-app", "nav_playground.html", "en", parent=home, apphook='SampleApp')
+        pathless = create_page("pathless-app", "nav_playground.html", "en", parent=home, apphook='SampleApp')
+
+        # A url that keeps its slug but loses its path -- the state djangocms-versioning
+        # leaves behind when a page is unpublished.
+        PageContent.objects.filter(page=pathless, language="en").delete()
+        pathless.update_urls("en", path=None)
+        self.assertIsNone(pathless.urls.get(language="en").path)
+
+        with force_language("en"):
+            self.reload_urls()
+            urlpatterns = get_app_patterns()  # must not raise TypeError
+
+            # the remaining apphook still resolves, i.e. the pathless page was skipped
+            # rather than the whole pattern list being abandoned
+            self.assertEqual(urlpatterns[0].reverse('sample-root'), 'live-app/')
 
     @override_settings(ROOT_URLCONF='cms.test_utils.project.urls')
     def test_apphook_urlpattern_order(self):
@@ -1081,3 +1116,63 @@ class ApphooksPageLanguageUrlTestCase(CMSTestCase):
         self.assertEqual(url, '/en/child_page/child_child_page/extra_1/')
 
         self.apphook_clear()
+
+
+class ApphookFrontendEditingTests(BaseApphooksTestCase):
+    """
+    Tests for rendering external models attached via apphooks in frontend editing mode.
+    Ensures that context remains consistent (e.g., current_page is resolved).
+    """
+
+
+    @override_settings(ROOT_URLCONF='cms.test_utils.project.urls')
+    def test_current_page_resolution_in_render_object_edit(self):
+        from django.contrib.sessions.backends.base import SessionBase
+
+        from cms.test_utils.project.sampleapp.models import Category
+
+        # 1. Setup: Create an apphooked page
+        superuser = self.get_superuser()
+        create_page(
+            title="Apphook Page",
+            template="nav_playground.html",
+            language="en",
+            created_by=superuser,
+            apphook="SampleApp"
+        )
+        self.reload_urls()
+
+        # 2. Setup: Create an external model instance (Category)
+        category = Category.add_root(name="Test Category")
+        ct = ContentType.objects.get_for_model(Category)
+
+        # 3. Setup: Register a mock renderer
+        cms_extension = apps.get_app_config('cms').cms_extension
+
+        def mock_render_category(request, obj):
+            t = Template("{% load cms_tags %}[{% page_attribute 'page_title' %}]")
+            return HttpResponse(t.render(Context({"request": request})))
+
+        original_renderer = cms_extension.toolbar_enabled_models.get(Category)
+        cms_extension.toolbar_enabled_models[Category] = mock_render_category
+
+        try:
+            # 4. Action: Create a request
+            url = f"/admin/cms/placeholder/render-object-edit/{ct.pk}/{category.pk}/"
+            request = RequestFactory().get(url)
+            request.user = superuser
+            request.session = SessionBase()
+            request.toolbar = CMSToolbar(request)
+
+            # 5. Execution
+            response = render_object_edit(request, ct.pk, category.pk)
+            content = response.content.decode('utf-8')
+
+            # 6. Verification
+            self.assertEqual(content, "[Apphook Page]")
+
+        finally:
+            if original_renderer:
+                cms_extension.toolbar_enabled_models[Category] = original_renderer
+            elif Category in cms_extension.toolbar_enabled_models:
+                del cms_extension.toolbar_enabled_models[Category]

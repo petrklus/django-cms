@@ -436,33 +436,33 @@ export const Helpers = {
     },
 
     /**
-     * We need to update the url with cms_path param for undo/redo
+     * We need to update the url with cms_path param for undo/redo.
+     * The query params of the current page are forwarded as well.
      *
      * @function updateUrlWithPath
      * @private
      * @param {String} url url
+     * @param {Array[]} [params] additional array of [`param`, `value`] arrays to set on the url
      * @returns {String} modified url
      */
-    updateUrlWithPath: function(url) {
+    updateUrlWithPath: function(url, params) {
         var win = this._getWindow();
         var path = win.location.pathname + win.location.search;
 
-        const fullUrl = new URL(url, win.location.origin);        
-        // any URL params present in the url parameter should be of higher priority        
-        const paramsFromUrl = new URLSearchParams(fullUrl.search);
+        const explicitParams = [['cms_path', path]].concat(params || []);
+        // `url` is parsed the same way `makeURL` does
+        const urlParams = new URLSearchParams(new URL(URL.decode(url.replace(/&amp;/g, '&'))).query());
+        const forwardedParams = [];
 
-        const excluded_params  = ['cms_path'];
-        for (const [key] of paramsFromUrl.entries()) {
-            excluded_params.push(key);
-        }        
+        // forward the query params of the current page; params already present in `url`
+        // or set explicitly are of higher priority
+        new URLSearchParams(win.location.search).forEach((value, key) => {
+            if (!urlParams.has(key) && !explicitParams.some(pair => pair[0] === key)) {
+                forwardedParams.push([key, value]);
+            }
+        });
 
-        // remove any conflicts
-        const params = new URLSearchParams(win.location.search);
-        for (const key of excluded_params) {
-            params.delete(key);
-        }
-
-        return this.makeURL(url, [['cms_path', path], ...params.entries()]);
+        return this.makeURL(url, explicitParams.concat(forwardedParams));
     },
 
     /**
@@ -560,6 +560,8 @@ export const KEYS = {
     TAB: 9,
     UP: 38,
     DOWN: 40,
+    LEFT: 37,
+    RIGHT: 39,
     ENTER: 13,
     SPACE: 32,
     ESC: 27,
