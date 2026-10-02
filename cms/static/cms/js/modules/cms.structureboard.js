@@ -1402,10 +1402,11 @@ class StructureBoard {
 
         this._replaceBodyWithHTML(newDoc.body);
 
-        if (typeof window.CMS_CUSTOM_HEAD_REPLACE_FUN === "function") {
-            window.CMS_CUSTOM_HEAD_REPLACE_FUN(document.head, newDoc.head);
+        if (typeof window.CMS_CUSTOM_HEAD_REPLACE_FUN === 'function') {
+            window.CMS_CUSTOM_HEAD_REPLACE_FUN(document.head, newDoc.head); // eslint-disable-line new-cap
         } else {
             const headDiff = dd.diff(document.head, nodeToObj(newDoc.head));
+
             dd.apply(document.head, headDiff);
         }
 

@@ -829,7 +829,24 @@ describe('cms.base.js', function() {
                     }
                 });
 
-                expect(CMS.API.Helpers.updateUrlWithPath('/')).toEqual('/?cms_path=%2Fde%2F%3Flanguage%3Den');
+                expect(CMS.API.Helpers.updateUrlWithPath('/'))
+                    .toEqual('/?cms_path=%2Fde%2F%3Flanguage%3Den&language=en');
+            });
+
+            it('forwards page params unless the url or the additional params already set them', function() {
+                spyOn(CMS.API.Helpers, '_getWindow').and.returnValue({
+                    location: {
+                        pathname: '/de/',
+                        search: '?language=de&_popup=0&tenant=x'
+                    }
+                });
+
+                expect(
+                    CMS.API.Helpers.updateUrlWithPath('/admin/app/model/1/change/?language=en', [['_popup', 1]])
+                ).toEqual(
+                    '/admin/app/model/1/change/?language=en' +
+                        '&cms_path=%2Fde%2F%3Flanguage%3Dde%26_popup%3D0%26tenant%3Dx&_popup=1&tenant=x'
+                );
             });
 
             it('sets additional params on urls that have no query string yet', function() {
